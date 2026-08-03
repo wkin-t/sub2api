@@ -11,7 +11,7 @@ import (
 // Chat Completions intermediary round-trip (e.g. thinking, cache_control,
 // structured system prompts).
 func AnthropicToResponses(req *AnthropicRequest) (*ResponsesRequest, error) {
-	input, err := convertAnthropicToResponsesInput(req.System, req.Messages)
+	input, err := convertAnthropicToResponsesInput(req.System, req.Messages, req.Model)
 	if err != nil {
 		return nil, err
 	}
@@ -115,7 +115,7 @@ func convertAnthropicToolChoiceToResponses(raw json.RawMessage) (json.RawMessage
 
 // convertAnthropicToResponsesInput builds the Responses API input items array
 // from the Anthropic system field and message list.
-func convertAnthropicToResponsesInput(system json.RawMessage, msgs []AnthropicMessage) ([]ResponsesInputItem, error) {
+func convertAnthropicToResponsesInput(system json.RawMessage, msgs []AnthropicMessage, model string) ([]ResponsesInputItem, error) {
 	var out []ResponsesInputItem
 
 	// System prompt → developer role input item. ChatGPT Codex SSE behaves like
@@ -137,7 +137,7 @@ func convertAnthropicToResponsesInput(system json.RawMessage, msgs []AnthropicMe
 	}
 
 	for _, m := range msgs {
-		items, err := anthropicMsgToResponsesItems(m)
+		items, err := anthropicMsgToResponsesItems(m, model)
 		if err != nil {
 			return nil, err
 		}
@@ -176,12 +176,12 @@ func isAnthropicBillingHeaderText(text string) bool {
 
 // anthropicMsgToResponsesItems converts a single Anthropic message into one
 // or more Responses API input items.
-func anthropicMsgToResponsesItems(m AnthropicMessage) ([]ResponsesInputItem, error) {
+func anthropicMsgToResponsesItems(m AnthropicMessage, model string) ([]ResponsesInputItem, error) {
 	switch m.Role {
 	case "user":
 		return anthropicUserToResponses(m.Content)
 	case "assistant":
-		return anthropicAssistantToResponses(m.Content)
+		return anthropicAssistantToResponses(m.Content, model)
 	default:
 		return anthropicUserToResponses(m.Content)
 	}
@@ -260,7 +260,9 @@ func anthropicUserToResponses(raw json.RawMessage) ([]ResponsesInputItem, error)
 // thinking blocks with signature → reasoning items (encrypted_content) so
 // multi-turn Grok/Codex prompt cache can reuse prior reasoning prefixes.
 // thinking without signature remains ignored (not accepted as plain text input).
-func anthropicAssistantToResponses(raw json.RawMessage) ([]ResponsesInputItem, error) {
+// model is the CURRENT turn's target model, used to decide whether a
+// GPT/Codex-style gAAAA signature is "foreign" ciphertext (see below).
+func anthropicAssistantToResponses(raw json.RawMessage, model string) ([]ResponsesInputItem, error) {
 	// Try plain string.
 	var s string
 	if err := json.Unmarshal(raw, &s); err == nil {
@@ -287,9 +289,17 @@ func anthropicAssistantToResponses(raw json.RawMessage) ([]ResponsesInputItem, e
 			continue
 		}
 		sig := strings.TrimSpace(b.Signature)
-		// Only replay provider ciphertext. Skip GPT/Codex-style gAAAA blobs and
-		// empty placeholders — xAI returns 400 on decrypt for foreign signatures.
-		if sig == "" || strings.HasPrefix(sig, "gAAAA") {
+		// Only replay provider ciphertext. GPT/Codex-style gAAAA blobs are foreign
+		// ciphertext to a NON-reasoning target (e.g. xAI/Grok, which returns 400
+		// trying to decrypt them) and must be dropped there. But when the current
+		// turn's target IS a reasoning model (gpt-5.x) and the signature it's
+		// replaying is its OWN gAAAA-prefixed encrypted_content from a prior turn,
+		// dropping it breaks multi-turn continuity: the Responses API was called
+		// with Include=["reasoning.encrypted_content"], so it expects a matching
+		// "reasoning" item on every subsequent turn and rejects the request with
+		// "invalid_prompt / Invalid Responses API request" when it's missing.
+		// Empty placeholders are always dropped regardless of target model.
+		if sig == "" || (strings.HasPrefix(sig, "gAAAA") && !isReasoningModel(model)) {
 			continue
 		}
 		items = append(items, ResponsesInputItem{

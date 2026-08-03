@@ -197,6 +197,66 @@ func TestAnthropicToResponses_ThinkingSignatureBecomesReasoning(t *testing.T) {
 	assert.Equal(t, "function_call", items[3].Type)
 }
 
+// TestAnthropicToResponses_GAAAASignatureReplayedForReasoningModel covers the
+// bug where a gpt-5.x model's OWN prior-turn encrypted_content (which is
+// naturally gAAAA-prefixed ciphertext) was being dropped by the cross-provider
+// "foreign signature" guard below, breaking multi-turn continuity for any
+// reasoning model with a real conversation history: the Responses API request
+// always sets Include=["reasoning.encrypted_content"], so a reasoning model
+// rejects a continuation that's missing its own reasoning item with
+// "invalid_prompt / Invalid Responses API request".
+func TestAnthropicToResponses_GAAAASignatureReplayedForReasoningModel(t *testing.T) {
+	req := &AnthropicRequest{
+		Model:     "gpt-5.6-luna",
+		MaxTokens: 1024,
+		Messages: []AnthropicMessage{
+			{Role: "user", Content: json.RawMessage(`"Hello"`)},
+			{Role: "assistant", Content: json.RawMessage(`[{"type":"thinking","thinking":"plan","signature":"gAAAAABqcF_X9u7h"},{"type":"text","text":"Hi!"}]`)},
+			{Role: "user", Content: json.RawMessage(`"More"`)},
+		},
+	}
+
+	resp, err := AnthropicToResponses(req)
+	require.NoError(t, err)
+
+	var items []ResponsesInputItem
+	require.NoError(t, json.Unmarshal(resp.Input, &items))
+	// user + reasoning + assistant text + user = 4
+	require.GreaterOrEqual(t, len(items), 3)
+	assert.Equal(t, "reasoning", items[1].Type)
+	assert.Equal(t, "gAAAAABqcF_X9u7h", items[1].EncryptedContent)
+}
+
+// TestAnthropicToResponses_GAAAASignatureStillDroppedForNonReasoningModel
+// pins down that the original cross-provider protection is preserved: a
+// gAAAA-prefixed (GPT/Codex-style) signature must still be dropped when the
+// CURRENT turn's target is a non-reasoning model such as xAI/Grok, which
+// returns 400 trying to decrypt foreign ciphertext.
+func TestAnthropicToResponses_GAAAASignatureStillDroppedForNonReasoningModel(t *testing.T) {
+	req := &AnthropicRequest{
+		Model:     "grok-4.5",
+		MaxTokens: 1024,
+		Messages: []AnthropicMessage{
+			{Role: "user", Content: json.RawMessage(`"Hello"`)},
+			{Role: "assistant", Content: json.RawMessage(`[{"type":"thinking","thinking":"plan","signature":"gAAAAABqcF_X9u7h"},{"type":"text","text":"Hi!"}]`)},
+			{Role: "user", Content: json.RawMessage(`"More"`)},
+		},
+	}
+
+	resp, err := AnthropicToResponses(req)
+	require.NoError(t, err)
+
+	var items []ResponsesInputItem
+	require.NoError(t, json.Unmarshal(resp.Input, &items))
+	// user + assistant(text only, gAAAA signature dropped for non-reasoning target) + user = 3
+	require.Len(t, items, 3)
+	assert.Equal(t, "assistant", items[1].Role)
+	var parts []ResponsesContentPart
+	require.NoError(t, json.Unmarshal(items[1].Content, &parts))
+	require.Len(t, parts, 1)
+	assert.Equal(t, "output_text", parts[0].Type)
+}
+
 func TestAnthropicToResponses_MaxTokensFloor(t *testing.T) {
 	req := &AnthropicRequest{
 		Model:     "gpt-5.2",
