@@ -210,6 +210,19 @@ func (s *OpenAIGatewayService) sendCCUpstreamRequest(
 			return nil, fmt.Errorf("set Cline Pass capability filter: %w", err)
 		}
 	}
+	if account.IsCline() {
+		ruleApplied := gjson.GetBytes(body, "model").String() == "cline-pass/deepseek-v4.1-flash-1017"
+		fields := []zap.Field{
+			zap.Int64("account_id", account.ID),
+			zap.String("model", gjson.GetBytes(body, "model").String()),
+			zap.Bool("routing_rule_applied", ruleApplied),
+			zap.Bool("stream", stream),
+		}
+		if ruleApplied {
+			fields = append(fields, zap.Strings("gateway_only", []string{"deepseek"}), zap.Strings("gateway_has", []string{"vision", "implicit-caching"}))
+		}
+		logger.FromContext(ctx).Info("cline_gateway_request", fields...)
+	}
 	// DeepSeek thinking mode 要求历史 assistant 回传 reasoning_content。
 	// Responses→CC 回退在加密-only / 缺 reasoning item 且缓存未命中时会漏掉该
 	// 字段，上游 400 "The `reasoning_content` in the thinking mode must be
@@ -267,6 +280,20 @@ func (s *OpenAIGatewayService) sendCCUpstreamRequest(
 		proxyURL = account.Proxy.URL()
 	}
 	resp, err := s.doOpenAIUpstream(upstreamReq, proxyURL, account)
+	if account.IsCline() {
+		fields := []zap.Field{
+			zap.Int64("account_id", account.ID),
+			zap.String("model", gjson.GetBytes(body, "model").String()),
+		}
+		if err != nil {
+			// 传输错误可能包含代理地址或请求细节，沿用既有错误处理，
+			// 测试日志仅记录失败类别，避免新增敏感信息输出。
+			logger.FromContext(ctx).Warn("cline_gateway_transport_error", fields...)
+		} else if resp != nil {
+			fields = append(fields, zap.Int("status_code", resp.StatusCode), zap.String("upstream_request_id", resp.Header.Get("X-Request-Id")))
+			logger.FromContext(ctx).Info("cline_gateway_response", fields...)
+		}
+	}
 	if err != nil {
 		return nil, s.handleOpenAIUpstreamTransportError(ctx, c, account, err, false)
 	}
