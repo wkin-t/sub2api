@@ -84,6 +84,52 @@ func TestClineGatewayForwardsToChatCompletions(t *testing.T) {
 	}
 }
 
+func TestClinePassDeepSeekRoutingAcrossIngresses(t *testing.T) {
+	for _, ingress := range routingMatrixIngresses() {
+		for _, model := range []string{"cline-pass/deepseek-v4.1-flash-1017", "cline-pass/glm-5.3-flash", "deepseek/deepseek-v4-flash"} {
+			t.Run(ingress.name+"/"+model, func(t *testing.T) {
+				upstream := &httpUpstreamRecorder{err: errors.New("stop after capture")}
+				svc := &OpenAIGatewayService{cfg: rawChatCompletionsTestConfig(), httpUpstream: upstream}
+				body := routingMatrixCase{ingress: ingress, model: model}.body()
+				_ = ingress.forward(svc, adaptiveProtocolTestContext(ingress.path, body), clineTestAccount(3), body)
+				require.NotEmpty(t, upstream.requests)
+				require.Equal(t, model, gjson.GetBytes(upstream.lastBody, "model").String())
+				gateway := gjson.GetBytes(upstream.lastBody, "providerOptions.gateway")
+				if model == "cline-pass/deepseek-v4.1-flash-1017" {
+					require.JSONEq(t, `{"only":["deepseek"],"has":["vision","implicit-caching"]}`, gateway.Raw)
+				} else {
+					require.False(t, gateway.Exists())
+				}
+			})
+		}
+	}
+}
+
+func TestClinePassDeepSeekRoutingScopeAndPreservation(t *testing.T) {
+	for _, platform := range []string{PlatformCline, PlatformOpenAI} {
+		t.Run(platform, func(t *testing.T) {
+			account := clineTestAccount(3)
+			account.Platform = platform
+			upstream := &httpUpstreamRecorder{err: errors.New("stop after capture")}
+			svc := &OpenAIGatewayService{cfg: rawChatCompletionsTestConfig(), httpUpstream: upstream}
+			body := []byte(`{"model":"cline-pass/deepseek-v4.1-flash-1017","messages":[{"role":"user","content":"hi"}],"providerOptions":{"other":{"enabled":true},"gateway":{"only":["other"],"has":["tool-use"],"custom":"keep"}}}`)
+			c := adaptiveProtocolTestContext("/v1/chat/completions", body)
+			_, _ = svc.sendCCUpstreamRequest(context.Background(), c, account, "https://api.cline.bot/api/v1/chat/completions", body, false, "test", "", "")
+			require.NotEmpty(t, upstream.requests)
+			if platform == PlatformOpenAI {
+				require.JSONEq(t, string(body), string(upstream.lastBody))
+				return
+			}
+			require.Equal(t, "deepseek", gjson.GetBytes(upstream.lastBody, "providerOptions.gateway.only.0").String())
+			require.Equal(t, "vision", gjson.GetBytes(upstream.lastBody, "providerOptions.gateway.has.0").String())
+			require.Equal(t, "implicit-caching", gjson.GetBytes(upstream.lastBody, "providerOptions.gateway.has.1").String())
+			require.True(t, gjson.GetBytes(upstream.lastBody, "providerOptions.other.enabled").Bool())
+			require.Equal(t, "keep", gjson.GetBytes(upstream.lastBody, "providerOptions.gateway.custom").String())
+			require.Equal(t, "hi", gjson.GetBytes(upstream.lastBody, "messages.0.content").String())
+		})
+	}
+}
+
 // 连接测试未指定模型时：订阅了 ClinePass 用订阅模型（不消耗积分），否则用按量模型；
 // ClinePass 钱包冷却中也用按量模型；自适应与固定 Chat Completions 一致。
 func TestAccountTestService_ClineDefaultTestModel(t *testing.T) {

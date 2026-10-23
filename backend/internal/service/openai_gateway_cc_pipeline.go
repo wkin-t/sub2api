@@ -16,6 +16,8 @@ import (
 	"github.com/Wei-Shaw/sub2api/internal/pkg/logger"
 	"github.com/Wei-Shaw/sub2api/internal/util/responseheaders"
 	"github.com/gin-gonic/gin"
+	"github.com/tidwall/gjson"
+	"github.com/tidwall/sjson"
 	"go.uber.org/zap"
 )
 
@@ -195,6 +197,19 @@ func (s *OpenAIGatewayService) sendCCUpstreamRequest(
 	userAgent string,
 	grokCacheIdentity string,
 ) (*http.Response, error) {
+	// 转换会重建请求体，必须在最终出站点约束这个 Pass 模型，防止客户端
+	// 扩展字段丢失或覆盖路由；其他模型继续使用各自的上游选择策略。
+	if account.IsCline() && gjson.GetBytes(body, "model").String() == "cline-pass/deepseek-v4.1-flash-1017" {
+		var err error
+		body, err = sjson.SetBytes(body, "providerOptions.gateway.only", []string{"deepseek"})
+		if err != nil {
+			return nil, fmt.Errorf("set Cline Pass provider restriction: %w", err)
+		}
+		body, err = sjson.SetBytes(body, "providerOptions.gateway.has", []string{"vision", "implicit-caching"})
+		if err != nil {
+			return nil, fmt.Errorf("set Cline Pass capability filter: %w", err)
+		}
+	}
 	// DeepSeek thinking mode 要求历史 assistant 回传 reasoning_content。
 	// Responses→CC 回退在加密-only / 缺 reasoning item 且缓存未命中时会漏掉该
 	// 字段，上游 400 "The `reasoning_content` in the thinking mode must be
