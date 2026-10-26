@@ -542,6 +542,34 @@ describe('admin UsageTable tooltip', () => {
 		expect(text).toContain(expectedBadge)
 	})
 
+	it('renders an upstream provider pill badge when upstream_response_model contains a provider prefix', () => {
+		const wrapper = mount(UsageTable, {
+			props: {
+				data: [{
+					request_id: 'req-cline-deepseek',
+					model: 'cline-pass/deepseek-v4.1-flash-1017',
+					upstream_model: 'cline-pass/deepseek-v4.1-flash-1017',
+					upstream_response_model: 'deepseek/deepseek-v4.1-flash-1017',
+					upstream_model_mismatch: true,
+				}],
+				loading: false,
+				columns: [],
+			},
+			global: {
+				stubs: {
+					DataTable: DataTableStub,
+					EmptyState: true,
+					Icon: true,
+					Teleport: true,
+				},
+			},
+		})
+
+		const badge = wrapper.get('[data-testid="upstream-provider-badge"]')
+		expect(badge.text()).toBe('deepseek')
+		expect(badge.attributes('title')).toContain('deepseek/deepseek-v4.1-flash-1017')
+	})
+
   it.each([
     {
       name: 'defaulted row',

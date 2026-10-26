@@ -26,9 +26,10 @@ const (
 // separate from the final outbound request tier until usage recording resolves
 // the billable tier for the selected credential protocol.
 type upstreamResponseModelObserver struct {
-	first    string
-	terminal string
-	conflict bool
+	first       string
+	terminal    string
+	routingSlug string
+	conflict    bool
 
 	// firstTier holds the first non-terminal tier declaration; it is discarded
 	// when later non-terminal declarations disagree. terminalTier comes from a
@@ -43,7 +44,7 @@ func (o *upstreamResponseModelObserver) Observe(model string, terminal bool) {
 	if model == "" {
 		return
 	}
-	current := o.Model()
+	current := o.declaredModel()
 	if current != "" && !strings.EqualFold(current, model) {
 		o.conflict = true
 	}
@@ -54,6 +55,27 @@ func (o *upstreamResponseModelObserver) Observe(model string, terminal bool) {
 	if o.first == "" {
 		o.first = model
 	}
+}
+
+func (o *upstreamResponseModelObserver) ObserveRoutingSlug(slug string) {
+	slug = normalizeObservedUpstreamResponseModel(slug)
+	if slug == "" {
+		return
+	}
+	if o.routingSlug != "" && !strings.EqualFold(o.routingSlug, slug) {
+		o.conflict = true
+	}
+	o.routingSlug = slug
+}
+
+func (o *upstreamResponseModelObserver) declaredModel() string {
+	if o == nil {
+		return ""
+	}
+	if o.terminal != "" {
+		return o.terminal
+	}
+	return o.first
 }
 
 func normalizeObservedUpstreamResponseModel(model string) string {
@@ -69,7 +91,10 @@ func normalizeObservedUpstreamResponseModel(model string) string {
 }
 
 func (o *upstreamResponseModelObserver) ObserveOpenAI(payload []byte, eventType string) {
-	model := firstValidTrimmedGJSONString(payload, "response.model", "model")
+	if routingModel := extractGatewayRoutingModel(payload); routingModel != "" {
+		o.ObserveRoutingSlug(routingModel)
+	}
+	model := firstValidTrimmedGJSONString(payload, "response.model", "model", "data.model")
 	terminal := isUpstreamResponseModelTerminalEvent(eventType)
 	o.Observe(model, terminal)
 	// Every payload that declares a service tier also declares a model, so
@@ -85,6 +110,30 @@ func (o *upstreamResponseModelObserver) ObserveOpenAI(payload []byte, eventType 
 	}
 	tier := normalizeObservedOpenAIServiceTier(firstValidTrimmedGJSONString(payload, "response.service_tier", "service_tier"))
 	o.ObserveServiceTier(tier, terminal)
+}
+
+func extractGatewayRoutingModel(payload []byte) string {
+	if len(payload) == 0 || !bytesContainsGatewayRouting(payload) {
+		return ""
+	}
+	if slug := firstValidTrimmedGJSONString(
+		payload,
+		"choices.0.delta.provider_metadata.gateway.routing.canonicalSlug",
+		"choices.0.message.provider_metadata.gateway.routing.canonicalSlug",
+		"data.choices.0.message.provider_metadata.gateway.routing.canonicalSlug",
+	); slug != "" {
+		return slug
+	}
+	return firstValidTrimmedGJSONString(
+		payload,
+		"choices.0.delta.provider_metadata.gateway.routing.finalProvider",
+		"choices.0.message.provider_metadata.gateway.routing.finalProvider",
+		"data.choices.0.message.provider_metadata.gateway.routing.finalProvider",
+	)
+}
+
+func bytesContainsGatewayRouting(payload []byte) bool {
+	return strings.Contains(string(payload), "provider_metadata")
 }
 
 func (o *upstreamResponseModelObserver) ObserveAnthropic(payload []byte) {
@@ -175,10 +224,10 @@ func (o *upstreamResponseModelObserver) Model() string {
 	if o == nil {
 		return ""
 	}
-	if o.terminal != "" {
-		return o.terminal
+	if o.routingSlug != "" {
+		return o.routingSlug
 	}
-	return o.first
+	return o.declaredModel()
 }
 
 func (o *upstreamResponseModelObserver) Conflict() bool {

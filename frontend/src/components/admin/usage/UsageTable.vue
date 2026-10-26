@@ -60,17 +60,22 @@
                    :class="i === 0 ? 'font-medium text-gray-900 dark:text-white' : 'text-gray-500 dark:text-gray-400'"
                    :style="i > 0 ? `padding-left: ${i * 0.75}rem` : ''">
                 <span v-if="i > 0" class="mr-0.5">↳</span>{{ step }}
+                <span v-if="i === 0 && upstreamProviderBadge(row)" data-testid="upstream-provider-badge" class="ml-1.5 inline-flex items-center rounded border border-emerald-200 bg-emerald-50/70 px-1.5 py-px align-middle text-[11px] font-medium leading-tight text-emerald-600 dark:border-emerald-500/30 dark:bg-emerald-500/10 dark:text-emerald-400" :title="modelAuditTitle(row)">{{ upstreamProviderBadge(row) }}</span>
               </div>
             </div>
             <div v-else-if="row.upstream_model && row.upstream_model !== row.model" class="space-y-0.5">
               <div class="break-all font-medium text-gray-900 dark:text-white">
                 {{ row.model }}
+                <span v-if="upstreamProviderBadge(row)" data-testid="upstream-provider-badge" class="ml-1.5 inline-flex items-center rounded border border-emerald-200 bg-emerald-50/70 px-1.5 py-px align-middle text-[11px] font-medium leading-tight text-emerald-600 dark:border-emerald-500/30 dark:bg-emerald-500/10 dark:text-emerald-400" :title="modelAuditTitle(row)">{{ upstreamProviderBadge(row) }}</span>
               </div>
               <div class="break-all text-gray-500 dark:text-gray-400">
                 <span class="mr-0.5">↳</span>{{ row.upstream_model }}
               </div>
             </div>
-            <span v-else class="font-medium text-gray-900 dark:text-white">{{ row.model }}</span>
+            <div v-else class="break-all">
+              <span class="font-medium text-gray-900 dark:text-white">{{ row.model }}</span>
+              <span v-if="upstreamProviderBadge(row)" data-testid="upstream-provider-badge" class="ml-1.5 inline-flex items-center rounded border border-emerald-200 bg-emerald-50/70 px-1.5 py-px align-middle text-[11px] font-medium leading-tight text-emerald-600 dark:border-emerald-500/30 dark:bg-emerald-500/10 dark:text-emerald-400" :title="modelAuditTitle(row)">{{ upstreamProviderBadge(row) }}</span>
+            </div>
             <div
               v-if="row.upstream_model_mismatch === true && row.upstream_response_model"
               class="break-all pl-3 text-[11px]"
@@ -633,6 +638,16 @@ const hasReasoningEffortMapping = (row: AdminUsageLog): boolean => {
 }
 
 const sentUpstreamModel = (row: AdminUsageLog): string => row.upstream_model?.trim() || row.model?.trim() || ''
+
+const upstreamProviderBadge = (row: AdminUsageLog): string => {
+  const response = row.upstream_response_model?.trim() || ''
+  if (!response) return ''
+  const slashIdx = response.indexOf('/')
+  if (slashIdx <= 0) return ''
+  const provider = response.slice(0, slashIdx).trim().toLowerCase()
+  if (!provider || provider === 'vmc') return ''
+  return provider
+}
 
 const normalizeModelVariant = (model: string): string => model
   .trim()

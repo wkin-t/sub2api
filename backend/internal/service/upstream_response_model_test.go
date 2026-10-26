@@ -270,3 +270,23 @@ func TestObservedUpstreamResponseServiceTierFromContext(t *testing.T) {
 	observer.ObserveOpenAI([]byte(`{"type":"response.completed","response":{"id":"resp_1","model":"gpt-5.6-sol","service_tier":"default"}}`), "response.completed")
 	require.Equal(t, "default", observedUpstreamResponseServiceTier(c))
 }
+
+func TestUpstreamResponseModelObserverExtractsClineGatewayRoutingSlug(t *testing.T) {
+	t.Run("streaming chunks prefer gateway routing canonicalSlug without false conflict", func(t *testing.T) {
+		observer := &upstreamResponseModelObserver{}
+		observer.ObserveOpenAI([]byte(`{"id":"chatcmpl-1","object":"chat.completion.chunk","model":"vmc/deepseek-v4p1-flash-1017-contributor-fallbacks","choices":[{"index":0,"delta":{"content":"hi"}}]}`), "")
+		observer.ObserveOpenAI([]byte(`{"id":"chatcmpl-1","object":"chat.completion.chunk","model":"vmc/deepseek-v4p1-flash-1017-contributor-fallbacks","choices":[{"index":0,"delta":{"provider_metadata":{"gateway":{"routing":{"finalProvider":"deepseek","canonicalSlug":"deepseek/deepseek-v4.1-flash-1017"}}}}}]}`), "")
+
+		require.Equal(t, "deepseek/deepseek-v4.1-flash-1017", observer.Model())
+		require.False(t, observer.Conflict())
+	})
+
+	t.Run("non-streaming data wrapper prefers gateway routing canonicalSlug", func(t *testing.T) {
+		observer := &upstreamResponseModelObserver{}
+		observer.ObserveOpenAI([]byte(`{"data":{"id":"chatcmpl-1","model":"vmc/deepseek-v4p1-flash-1017-contributor-fallbacks","choices":[{"index":0,"message":{"provider_metadata":{"gateway":{"routing":{"finalProvider":"deepseek","canonicalSlug":"deepseek/deepseek-v4.1-flash-1017"}}}}}]}}`), "")
+
+		require.Equal(t, "deepseek/deepseek-v4.1-flash-1017", observer.Model())
+		require.False(t, observer.Conflict())
+	})
+}
+
