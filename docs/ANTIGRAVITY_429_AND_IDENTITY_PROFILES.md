@@ -67,9 +67,9 @@
 | `SUB2API_ANTIGRAVITY_SESSION_ID_MODE` | `official` | `official`（官方常量 `-3750763034362895579`）/ `content`（旧行为：首条用户文本 sha256）/ `random` |
 | `SUB2API_ANTIGRAVITY_UA_PROFILE` | `hub` | `hub`（官方 hub 格式）/ `agy-cli`（CLI 格式，`auth_method=consumer`）/ `legacy`（旧无元组格式） |
 | `SUB2API_ANTIGRAVITY_UA_CL` | 按版本映射 | Piper changelist；默认按版本映射（1.5.9→1021519450、2.23.0→998057262、2.28.0→1008300195） |
-| `SUB2API_ANTIGRAVITY_UA_VERSION` | `2.28.0` | 官方客户端版本（也可用 `ANTIGRAVITY_USER_AGENT_VERSION` 或后台 `antigravity_user_agent_version` 覆盖） |
-| `SUB2API_ANTIGRAVITY_UA_OS` / `_ARCH` | `windows` / `amd64` | UA 元组中的平台标识 |
-| `SUB2API_ANTIGRAVITY_HTTP2` | `1` | Antigravity 推理是否使用 HTTP/2（与官方 Go 客户端一致）；`0` 回退 HTTP/1.1 |
+| `ANTIGRAVITY_USER_AGENT_VERSION` | `2.23.0` | 官方客户端版本（也可用后台 `antigravity_user_agent_version` 覆盖）。默认保持上游验证过的 2.23.0；显式设 `2.28.0` 可对齐最新 hub，但会改变上游模型门控 |
+| `SUB2API_ANTIGRAVITY_UA_OS` / `_ARCH` | `windows` / `amd64` | UA 元组中的平台标识；抓包样本是 darwin/arm64，部署默认 windows/amd64，可 env 覆盖 |
+| `SUB2API_ANTIGRAVITY_HTTP2` | `1` | Antigravity 推理是否使用 HTTP/2（与官方 Go 客户端一致，属有意的默认行为变更）；`0` 回退 HTTP/1.1 |
 | `SUB2API_ANTIGRAVITY_MODEL_ENUM_MAP` | 空 | 追加 `labels.model_enum` 映射（JSON：`{"模型":"MODEL_PLACEHOLDER_Mxxx"}`） |
 | 后台设置 `enable_identity_patch` | `true` | 是否注入身份补丁（Antigravity 转发路径强制开启） |
 | 后台设置 `identity_patch_prompt` | 空 | 非空时覆盖 profile，作为身份提示词正文 |
@@ -138,12 +138,23 @@ ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now();
 本分支实现（`backend/internal/pkg/antigravity/envelope.go` + `service/antigravity_wire_identity.go`）：
 
 - sessionId 默认官方常量；`SUB2API_ANTIGRAVITY_SESSION_ID_MODE=content/random` 可回退/实验。
-- agent/trajectory UUID 由 `(客户端 session id 或首条用户文本) + 服务账号` 派生：
+- agent/trajectory UUID 由 `WireIdentity{ConversationSeed, AccountID}` 派生：优先用客户端 session id，
+  缺失时用 `sha256(首条用户文本 + systemInstruction)` 作为会话种子，再拼服务账号；
   同一会话稳定，账号切换时重新起 cascade（避免同一 cascade 出现在多个账号上、把号池关联成一个客户端）。
+  已知残余：无 session header 且首条用户文本与 systemInstruction 都相同的两个会话仍会碰撞。
+- CLI 形态（`SUB2API_ANTIGRAVITY_UA_PROFILE=agy-cli`）的 labels 额外带
+  `client="antigravity-cli"` / `conversation_id` / `cascade_id` / `root_cascade_id`；
+  默认 hub 形态按 Windows 原生客户端抓包保持 8 个 label，不臆造 cascade 字段。
 - `step` / `request_id` 的计数由 contents 长度近似（无状态网关无法复现客户端侧真实计数器）；
   `last_execution_id` 暂缺（需要跨请求状态存储）。
 - labels 中 `model_enum` 只对已抓包确认的模型映射（`gemini-3.7-flash-high`→`M298`、
-  `claude-sonnet-4-6`→`M35`），其余留空（上游接受缺省）；可用 env 追加。
+  `gemini-4-hydrogen`→`M462`、`claude-sonnet-4-6`→`M35`），其余留空（上游接受缺省）；可用 env 追加。
+- Gemini 原生链路统一走 `pkg/antigravity.WrapGeminiRequest`：补 sessionId/labels/requestId、
+  保留未知字段；`request` 对象仍会按键名排序（JSON map 无法保序，属已知差异）。
+- system 角色消息块（`messages[].role=="system"`）也会经过触发句清洗，不再只清洗顶层 `system` 字段。
+- 客户端已带 Antigravity 身份时，先被改写为中性句、再注入本次配置的身份段（用户要求：只替换身份段）。
+- 控制面请求（`setUserSettings` / `fetchUserInfo`）已移除多余的 `X-Goog-Api-Client: gl-node/…`
+  （Node 指纹，官方 Go 客户端不发）。
 
 ## 5. UA 与 cl
 
@@ -154,7 +165,12 @@ ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now();
   `antigravity/hub/2.28.0 (…; cl=1008300195)`（Antigravity-Manager 校准值）
 
 sub2api 原来发的是旧格式 `antigravity/hub/2.23.0 windows/amd64`（没有 `aidev_client` 元组和 `cl`）。
-本分支默认改为 **hub 2.28.0 + cl=1008300195**，版本与 cl 按映射表配对（避免版本改了 cl 没改）；
+本分支默认改为 **hub 2.23.0 + cl=998057262**（保留上游验证过的版本，避免默认改变模型门控），
+版本与 cl 按映射表配对（`1.5.9`→`1021519450`、`2.23.0`→`998057262`、`2.28.0`→`1008300195`）；
+未知版本回退到默认版本的 cl，保证永远是已观测到的一对。
+要更贴近最新官方客户端可显式设置 `ANTIGRAVITY_USER_AGENT_VERSION=2.28.0`
+（文档 `recon/agy-wire-fingerprint.md` 的样本是 windows/amd64，Antigravity-Manager 记录的 hub 样本是 darwin/arm64，
+平台元组可用 `SUB2API_ANTIGRAVITY_UA_OS/_ARCH` 覆盖）。
 `SUB2API_ANTIGRAVITY_UA_PROFILE=agy-cli` 可切成 CLI 格式（`auth_method=consumer`）。
 **注意**：上游按 UA 家族 + 版本做模型门控（sub2api #8062：裸 UA 26 个模型、hub/2.23.0 29 个模型），
 改版本会改变可用模型集合，升级前先确认。
@@ -171,21 +187,24 @@ sub2api 原来发的是旧格式 `antigravity/hub/2.23.0 windows/amd64`（没有
 - **不要**给 Antigravity 套现有的 utls 指纹模板：内置默认 profile 是 Node.js 24.x（Claude Code）
   的 JA3/JA4，套在 Go 客户端上反而更不像官方；而且 utls 传输固定 HTTP/1.1，会和 h2 的 ALPN 冲突。
   当前 Antigravity 链路没有接入 `DoWithTLS`（账号 `enable_tls_fingerprint` 也只对 Anthropic 生效）。
-- 若未来要做到 JA3/JA4 字节级一致：需要把构建工具链对齐到 Go 1.28（agy 的构建版本），
-  或用 utls 定制 ClientHello 并同时实现 h2。**优先级低于 wire 字段与 UA/cl**。
+- 若未来要做到 JA3/JA4 字节级一致：agy 用 `go1.28-20261102-RC00` 构建，而本仓库 `backend/go.mod`
+  要求 **Go 1.27.3**（CI 断言 1.27.x；`go version` 显示的本地工具链版本可能不同，因为 Go 会按 go.mod
+  自动切换 toolchain）。需要把构建工具链对齐到 Go 1.28，或用 utls 定制 ClientHello 并同时实现 h2。
+  **优先级低于 wire 字段与 UA/cl**。
 
 
 
 ## 7. 新增/修改的代码位置
 
 - `backend/internal/pkg/antigravity/upstream_trigger_filter.go` — 触发句清洗（默认模式 + env 扩展）
-- `backend/internal/pkg/antigravity/request_transformer.go` — `NeutralizeSystemIdentity` 接入清洗；opener 增加 Pi / Hermes；生成 wire 身份（sessionId/labels/requestId）
+- `backend/internal/pkg/antigravity/request_transformer.go` — `NeutralizeSystemIdentity` 接入清洗（含 system 角色消息块）；opener 增加 Pi / Antigravity；生成 wire 身份
 - `backend/internal/pkg/antigravity/identity_profiles.go` + `prompts/` — 身份 profile（`go:embed` 两个官方身份变体）
-- `backend/internal/pkg/antigravity/envelope.go` — wire 身份：官方 sessionId 常量、agent/trajectory UUID 派生、labels、requestId、model_enum
-- `backend/internal/pkg/antigravity/oauth.go` — 官方 UA 家族（hub/agy-cli/legacy）+ 版本/CL/平台元组
+- `backend/internal/pkg/antigravity/envelope.go` — wire 身份：`WireIdentity`、官方 sessionId 常量、agent/trajectory UUID 派生、labels、requestId、model_enum、`WrapGeminiRequest`
+- `backend/internal/pkg/antigravity/oauth.go` — 官方 UA 家族类型（hub/agy-cli/legacy）+ 版本/CL/平台元组
 - `backend/internal/pkg/antigravity/gemini_types.go` — 请求结构体字段顺序 + `labels` 字段
 - `backend/internal/service/antigravity_wire_identity.go` — 会话种子/账号作用域、HTTP/2 传输标记
-- `backend/internal/service/antigravity_gateway_service.go` — `wrapV1InternalRequestWithContext` 补全 Gemini 链路 wire 身份；`injectIdentityPatchToGeminiRequest` 支持自定义提示词、清洗后空 part 物理移除
+- `backend/internal/service/antigravity_gateway_wire.go` — `wrapV1InternalRequestWithContext`（Gemini 链路 wire 身份）
+- `backend/internal/service/antigravity_gateway_service.go` — `injectIdentityPatchToGeminiRequest`（自定义提示词、幂等、清洗后空 part 物理移除）、连接测试请求携带 wire 身份
 - `backend/internal/service/antigravity_gateway_gemini.go` / `antigravity_gateway_compat.go` — 两条 Gemini 链路使用后台配置的提示词 + wire 身份
 - `backend/internal/service/antigravity_gateway_claude.go` — 签名重试路径也强制注入身份（与主路径一致）
 - `backend/internal/service/antigravity_gateway_retry.go` / `antigravity_credits_overages.go` — 推理请求携带 HTTP/2 传输标记
@@ -207,6 +226,7 @@ sub2api 原来发的是旧格式 `antigravity/hub/2.23.0 windows/amd64`（没有
 cd backend
 go test -tags=unit ./internal/pkg/antigravity/
 go test -tags=unit -run 'Antigravity|IdentityPatch|Attribution' ./internal/service/
+go test -tags=unit ./...        # 合并前跑全量 unit
 go build ./...
 ```
 
@@ -216,14 +236,17 @@ wire 身份可用本地网关对照验证：把 agy 指向本地明文服务（`
 
 已知未对齐（按影响排序）：
 
-- `toolConfig`：真机样本没有，sub2api 恒发 `mode=VALIDATED`（上游历史验证为必需，保留）。
+- `<user_information>` 的 `Conversation ID`：真机会话身份的一部分，sub2api 目前只替换 identity 段。
 - `last_execution_id`：真机历史轮次带上一轮 response id，sub2api 无跨请求状态，暂缺。
 - `labels.last_step_index / request_id` 计数：由 contents 长度近似，非客户端真实计数器。
-- systemInstruction 里没有 `<user_information>` 的 `Conversation ID`（真机会话身份的一部分）；
-  身份 profile 目前只替换 identity 段。
+- hub 形态没有 `cascade_id` / `root_cascade_id` / `client` labels：这几项只在 CLI 形态
+  （`SUB2API_ANTIGRAVITY_UA_PROFILE=agy-cli`）按 agy 抓包补上；hub 抓包样本本身没有这些字段。
+- 无 session header 时，若首条用户文本与 systemInstruction 完全相同，不同会话仍可能撞同一身份
+  （无状态网关的固有限制；真实客户端用本地会话状态保证唯一）。
 - Gemini 原生链路的 `request` 内部键序经 map 重排，与真机顺序不同。
-- TLS/HTTP2：官方是 Go 1.28 默认指纹；sub2api 构建用 Go 1.26.2，即使同为 Go，ClientHello
-  也可能因版本差异略有不同；utls 定制 + h2 一致是后续工作。
+- `toolConfig`：真机样本没有，sub2api 恒发 `mode=VALIDATED`（上游历史验证为必需，保留）。
+- TLS：官方是 Go 1.28 默认指纹；本仓库按 go.mod 用 Go 1.27.3 构建，ClientHello 可能因版本差异
+  略有不同；utls 定制 + h2 一致是后续工作。
 
 后续可选项（未实现）：
 
@@ -237,7 +260,8 @@ wire 身份可用本地网关对照验证：把 agy 指向本地明文服务（`
 
 - 消费端 OAuth 令牌调用 `cloudcode-pa` 私有端点本身违反 Google 服务条款，已有封号公开报告；
   本分支只解决「内容误触发」的工程问题，不改变这一事实。
-- 黑名单是滚动更新的；新增触发句时通过 `SUB2API_ANTIGRAVITY_STRIP_PATTERNS` 热配置，无需改代码。
+- 黑名单是滚动更新的；新增触发句时通过 `SUB2API_ANTIGRAVITY_STRIP_PATTERNS` 追加，
+  但 env 在进程启动时读取一次，**改完需要重启**（不是热配置）。
 - 任何指纹伪装都是军备竞赛，不能承诺长期有效。
 
 ## 10. 参考链接
