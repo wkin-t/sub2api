@@ -2,23 +2,26 @@ package antigravity
 
 // Gemini v1internal 请求/响应类型定义
 
-// V1InternalRequest v1internal 请求包装
+// V1InternalRequest v1internal 请求包装。
+// 字段顺序与真机抓包一致：project, userAgent, requestType, model, requestId, request。
 type V1InternalRequest struct {
 	Project     string        `json:"project"`
-	RequestID   string        `json:"requestId"`
 	UserAgent   string        `json:"userAgent"`
 	RequestType string        `json:"requestType,omitempty"`
 	Model       string        `json:"model"`
+	RequestID   string        `json:"requestId"`
 	Request     GeminiRequest `json:"request"`
 }
 
-// GeminiRequest Gemini 请求内容
+// GeminiRequest Gemini 请求内容。
+// 字段顺序与真机抓包一致：contents, systemInstruction, tools, labels, generationConfig, sessionId。
 type GeminiRequest struct {
 	Contents          []GeminiContent         `json:"contents"`
 	SystemInstruction *GeminiContent          `json:"systemInstruction,omitempty"`
-	GenerationConfig  *GeminiGenerationConfig `json:"generationConfig,omitempty"`
 	Tools             []GeminiToolDeclaration `json:"tools,omitempty"`
 	ToolConfig        *GeminiToolConfig       `json:"toolConfig,omitempty"`
+	Labels            map[string]string       `json:"labels,omitempty"`
+	GenerationConfig  *GeminiGenerationConfig `json:"generationConfig,omitempty"`
 	SafetySettings    []GeminiSafetySetting   `json:"safetySettings,omitempty"`
 	SessionID         string                  `json:"sessionId,omitempty"`
 }

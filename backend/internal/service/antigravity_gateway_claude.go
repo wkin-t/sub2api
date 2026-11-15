@@ -38,6 +38,8 @@ func (s *AntigravityGatewayService) Forward(ctx context.Context, c *gin.Context,
 
 	sessionID := getSessionID(c)
 	prefix := logPrefix(sessionID, account.Name)
+	// wire 身份（agent/trajectory/labels/requestId）按客户端会话 + 服务账号派生。
+	ctx = withAntigravityWireIdentity(ctx, sessionID, account.ID)
 
 	// 解析 Claude 请求
 	var claudeReq antigravity.ClaudeRequest

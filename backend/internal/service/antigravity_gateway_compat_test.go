@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/Wei-Shaw/sub2api/internal/config"
+	"github.com/Wei-Shaw/sub2api/internal/pkg/antigravity"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/apicompat"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/require"
@@ -682,11 +683,14 @@ func antigravityCompatIntPtr(v int) *int { return &v }
 func TestAntigravityCompatRoutesByMappedModelFamily(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	tests := []struct {
-		model         string
+		model string
+		// 两条链路都经 wrapV1InternalRequestWithContext 补全真机 wire 身份，
+		// 因此 Gemini / Claude 家族的请求都应带 sessionId 与 labels。
 		wantSessionID bool
+		wantLabels    bool
 	}{
-		{model: "gemini-3.1-pro-high", wantSessionID: false},
-		{model: "claude-sonnet-4-5", wantSessionID: true},
+		{model: "gemini-3.1-pro-high", wantSessionID: true, wantLabels: true},
+		{model: "claude-sonnet-4-5", wantSessionID: true, wantLabels: true},
 	}
 
 	for _, tt := range tests {
@@ -709,6 +713,9 @@ func TestAntigravityCompatRoutesByMappedModelFamily(t *testing.T) {
 			require.Len(t, upstream.requestBodies, 1)
 			require.Equal(t, tt.model, gjson.GetBytes(upstream.requestBodies[0], "model").String())
 			require.Equal(t, tt.wantSessionID, gjson.GetBytes(upstream.requestBodies[0], "request.sessionId").Exists())
+			require.Equal(t, antigravity.OfficialAntigravitySessionID, gjson.GetBytes(upstream.requestBodies[0], "request.sessionId").String())
+			require.Equal(t, tt.wantLabels, gjson.GetBytes(upstream.requestBodies[0], "request.labels").Exists())
+			require.Regexp(t, `^agent/[0-9a-f-]{36}/[0-9]+$`, gjson.GetBytes(upstream.requestBodies[0], "requestId").String())
 		})
 	}
 }

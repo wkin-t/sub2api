@@ -215,6 +215,7 @@ func (s *AntigravityGatewayService) forwardAntigravityCompat(
 	request antigravityCompatRequest,
 ) (*ForwardResult, error) {
 	beginUpstreamResponseModelObservation(c)
+	ctx = withAntigravityWireIdentity(ctx, antigravityWireSeed(c), account.ID)
 	call, err := s.prepareAntigravityCompatCall(ctx, c, account, request)
 	if err != nil {
 		return nil, err
@@ -329,7 +330,7 @@ func (s *AntigravityGatewayService) buildAntigravityCompatGeminiBody(
 		if cleaned, cleanErr := cleanGeminiRequest(body); cleanErr == nil {
 			body = cleaned
 		}
-		return s.wrapV1InternalRequest(projectID, mappedModel, body)
+		return s.wrapV1InternalRequestWithContext(ctx, projectID, mappedModel, body)
 	}
 
 	options := s.getClaudeTransformOptions(ctx)

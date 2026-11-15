@@ -14,7 +14,6 @@ import (
 	"time"
 
 	"github.com/Wei-Shaw/sub2api/internal/pkg/gemini"
-	"github.com/google/uuid"
 )
 
 var (
@@ -47,6 +46,12 @@ type TransformOptions struct {
 	// 为空时使用默认模板（包含 [IDENTITY_PATCH] 及 SYSTEM_PROMPT_BEGIN 标记）。
 	IdentityPatch string
 	EnableMCPXML  bool
+	// ConversationSeed 是调用方提供的会话种子（通常是客户端 session id）；
+	// 为空时由请求内容派生。用于生成稳定的 agent/trajectory 身份。
+	ConversationSeed string
+	// AccountID 是本次请求实际使用的服务账号，用于把 wire 身份限定在账号内，
+	// 避免同一 cascade 出现在多个 OAuth 账号上（上游会把它们视为同一客户端）。
+	AccountID int64
 }
 
 func DefaultTransformOptions() TransformOptions {
@@ -145,11 +150,15 @@ func TransformClaudeToGeminiWithOptions(claudeReq *ClaudeRequest, projectID, map
 	// 4. 构建 tools
 	tools := buildTools(claudeReq.Tools)
 
-	// 5. 构建内部请求
+	// 5. 构建内部请求。
+	// 请求身份（sessionId / labels / requestId）按真机客户端的 wire 结构生成，
+	// 见 envelope.go：sessionId 是官方常量，requestId 为 agent/<agentId>/<step>，
+	// labels 携带 trajectory / request / model_enum 等字段。
+	envelope := BuildWireEnvelope(targetModel, contents, opts.ConversationSeed, opts.AccountID)
 	innerRequest := GeminiRequest{
-		Contents: contents,
-		// 总是生成 sessionId，基于用户消息内容
-		SessionID: generateStableSessionID(contents),
+		Contents:  contents,
+		SessionID: envelope.SessionID,
+		Labels:    envelope.Labels,
 	}
 
 	// toolConfig must always be present: upstream rejects requests without it,
@@ -173,18 +182,19 @@ func TransformClaudeToGeminiWithOptions(claudeReq *ClaudeRequest, projectID, map
 		innerRequest.Tools = tools
 	}
 
-	// 如果提供了 metadata.user_id，优先使用
-	if claudeReq.Metadata != nil && claudeReq.Metadata.UserID != "" {
+	// 仅在 content 模式下保留 metadata.user_id 覆盖（历史行为）；
+	// official 模式必须与真机一致，始终使用官方常量 sessionId。
+	if sessionIDMode == sessionIDModeContent && claudeReq.Metadata != nil && claudeReq.Metadata.UserID != "" {
 		innerRequest.SessionID = claudeReq.Metadata.UserID
 	}
 
 	// 6. 包装为 v1internal 请求
 	v1Req := V1InternalRequest{
 		Project:     projectID,
-		RequestID:   "agent-" + uuid.New().String(),
 		UserAgent:   "antigravity", // 固定值，与官方客户端一致
 		RequestType: requestType,
 		Model:       targetModel,
+		RequestID:   envelope.RequestID,
 		Request:     innerRequest,
 	}
 

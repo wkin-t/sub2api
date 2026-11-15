@@ -7,6 +7,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"fmt"
+	"log"
 	"net/http"
 	"net/url"
 	"os"
@@ -39,8 +40,29 @@ const (
 	// 注意：UA 与账号类型（IDE/CLI）、模型门控和配额归属相关，改动前先确认。
 	AntigravityUserAgentEnv = "SUB2API_ANTIGRAVITY_USER_AGENT"
 
-	// DefaultUserAgentVersion 是未通过环境变量或后台设置覆盖时使用的默认版本号。
-	DefaultUserAgentVersion = "2.23.0"
+	// AntigravityUserAgentProfileEnv 选择官方 UA 家族（默认 hub）：
+	//   hub      → antigravity/hub/<ver> (aidev_client; os_type=...; arch=...; cl=...)
+	//   agy-cli  → antigravity/cli/<ver> (aidev_client; os_type=...; arch=...; cl=...; auth_method=consumer)
+	//   legacy   → antigravity/hub/<ver> windows/amd64（旧格式，无 aidev_client 元组）
+	AntigravityUserAgentProfileEnv = "SUB2API_ANTIGRAVITY_UA_PROFILE"
+
+	// 官方 UA 元组中 os_type / arch / cl 的覆盖项。
+	AntigravityUserAgentCLEnv   = "SUB2API_ANTIGRAVITY_UA_CL"
+	AntigravityUserAgentOSEnv   = "SUB2API_ANTIGRAVITY_UA_OS"
+	AntigravityUserAgentArchEnv = "SUB2API_ANTIGRAVITY_UA_ARCH"
+
+	// DefaultUserAgentVersion 是未通过环境变量或后台设置覆盖时使用的默认版本号
+	// （Antigravity hub 2.28.0，2026-11-06 校准）。
+	DefaultUserAgentVersion = "2.28.0"
+	// DefaultUserAgentCL 是 hub 2.28.0 的 Piper changelist。
+	DefaultUserAgentCL = "1008300195"
+	// DefaultAGYCLIVersion / DefaultAGYCLICL 是 Antigravity CLI 的默认版本与 CL
+	// （1.5.9 实测 UA：antigravity/cli/1.5.9 (aidev_client; os_type=windows; arch=amd64; cl=1021519450; …)）。
+	DefaultAGYCLIVersion = "1.5.9"
+	DefaultAGYCLICL      = "1021519450"
+	// DefaultUserAgentOS / DefaultUserAgentArch 是官方构建上报的平台标识。
+	DefaultUserAgentOS   = "windows"
+	DefaultUserAgentArch = "amd64"
 
 	// 固定的 redirect_uri（用户需手动复制 code）
 	RedirectURI = "http://localhost:8085/callback"
@@ -81,10 +103,70 @@ var defaultClientSecret = "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"
 // fullUserAgentOverride 非空时完全替换 BuildUserAgent 的输出。
 var fullUserAgentOverride string
 
+// 官方 UA 家族与元组参数（默认 hub）。环境变量在进程启动时解析一次。
+var (
+	antigravityUserAgentProfile = resolveUserAgentProfile()
+	userAgentCLOverride         = strings.TrimSpace(os.Getenv(AntigravityUserAgentCLEnv))
+	userAgentOS                 = firstNonEmpty(strings.TrimSpace(os.Getenv(AntigravityUserAgentOSEnv)), DefaultUserAgentOS)
+	userAgentArch               = firstNonEmpty(strings.TrimSpace(os.Getenv(AntigravityUserAgentArchEnv)), DefaultUserAgentArch)
+)
+
+// userAgentCLByVersion maps a client version to the Piper changelist observed
+// for it, so a version override (env or admin setting) cannot pair with a
+// mismatched cl.
+var userAgentCLByVersion = map[string]string{
+	"1.3.1":  "994719654",
+	"1.5.9":  "1021519450",
+	"2.23.0": "998057262",
+	"2.28.0": "1008300195",
+}
+
+func userAgentCLForVersion(version, profile string) string {
+	if userAgentCLOverride != "" {
+		return userAgentCLOverride
+	}
+	if cl, ok := userAgentCLByVersion[version]; ok {
+		return cl
+	}
+	return defaultCLForProfile(profile)
+}
+
+func resolveUserAgentProfile() string {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv(AntigravityUserAgentProfileEnv))) {
+	case "", "hub":
+		return "hub"
+	case "agy-cli", "agy", "cli":
+		return "agy-cli"
+	case "legacy":
+		return "legacy"
+	default:
+		log.Printf("[Antigravity] unknown %s=%q; using hub user agent", AntigravityUserAgentProfileEnv, os.Getenv(AntigravityUserAgentProfileEnv))
+		return "hub"
+	}
+}
+
+func defaultCLForProfile(profile string) string {
+	if profile == "agy-cli" {
+		return DefaultAGYCLICL
+	}
+	return DefaultUserAgentCL
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if value != "" {
+			return value
+		}
+	}
+	return ""
+}
+
 func init() {
-	// 从环境变量读取版本号，未设置则使用默认值
+	// 从环境变量读取版本号，未设置则使用默认值（agy-cli profile 默认 1.5.9）
 	if version := NormalizeUserAgentVersion(os.Getenv(AntigravityUserAgentVersionEnv)); version != "" {
 		defaultUserAgentVersion = version
+	} else if antigravityUserAgentProfile == "agy-cli" {
+		defaultUserAgentVersion = DefaultAGYCLIVersion
 	}
 	// 完整 UA 覆盖优先于版本号
 	fullUserAgentOverride = NormalizeFullUserAgent(os.Getenv(AntigravityUserAgentEnv))
@@ -142,14 +224,26 @@ func GetUserAgentVersionForContext(ctx context.Context) string {
 
 // BuildUserAgent 使用指定版本号构造 User-Agent；版本为空或非法时回退默认值。
 // 设置了完整 UA 覆盖（SUB2API_ANTIGRAVITY_USER_AGENT）时优先返回覆盖值。
+// 默认按真机抓包构造带 aidev_client / os_type / arch / cl 元组的官方格式。
 func BuildUserAgent(version string) string {
 	if fullUserAgentOverride != "" {
 		return fullUserAgentOverride
 	}
-	if normalized := NormalizeUserAgentVersion(version); normalized != "" {
-		return fmt.Sprintf("antigravity/hub/%s windows/amd64", normalized)
+	normalized := NormalizeUserAgentVersion(version)
+	if normalized == "" {
+		normalized = defaultUserAgentVersion
 	}
-	return fmt.Sprintf("antigravity/hub/%s windows/amd64", defaultUserAgentVersion)
+	cl := userAgentCLForVersion(normalized, antigravityUserAgentProfile)
+	switch antigravityUserAgentProfile {
+	case "legacy":
+		return fmt.Sprintf("antigravity/hub/%s windows/amd64", normalized)
+	case "agy-cli":
+		return fmt.Sprintf("antigravity/cli/%s (aidev_client; os_type=%s; arch=%s; cl=%s; auth_method=consumer)",
+			normalized, userAgentOS, userAgentArch, cl)
+	default:
+		return fmt.Sprintf("antigravity/hub/%s (aidev_client; os_type=%s; arch=%s; cl=%s)",
+			normalized, userAgentOS, userAgentArch, cl)
+	}
 }
 
 // GetUserAgentForContext 返回当前请求应使用的 User-Agent。

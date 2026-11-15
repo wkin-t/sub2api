@@ -15,7 +15,6 @@ import (
 
 	"github.com/Wei-Shaw/sub2api/internal/pkg/antigravity"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/logger"
-	"github.com/google/uuid"
 	"github.com/tidwall/gjson"
 )
 
@@ -370,6 +369,8 @@ func (s *AntigravityGatewayService) TestConnection(ctx context.Context, account 
 
 // TestConnectionWithPrompt 测试 Antigravity 账号连接，支持为图片生成模型指定测试提示词。
 func (s *AntigravityGatewayService) TestConnectionWithPrompt(ctx context.Context, account *Account, modelID string, prompt string) (*TestConnectionResult, error) {
+	// 连接测试也走同一套 wire 身份（seed 由请求内容派生，账号内稳定）。
+	ctx = withAntigravityWireIdentity(ctx, "", account.ID)
 
 	// 获取 token
 	if s.tokenProvider == nil {
@@ -551,6 +552,9 @@ func (s *AntigravityGatewayService) buildClaudeTestRequest(projectID, mappedMode
 
 func (s *AntigravityGatewayService) getClaudeTransformOptions(ctx context.Context) antigravity.TransformOptions {
 	opts := antigravity.DefaultTransformOptions()
+	identity := antigravityWireIdentityFromContext(ctx)
+	opts.ConversationSeed = identity.seed
+	opts.AccountID = identity.accountID
 	if s.settingService == nil {
 		return opts
 	}
@@ -736,9 +740,16 @@ func injectIdentityPatchToGeminiRequest(body []byte, identityPatch string) ([]by
 	return json.Marshal(request)
 }
 
-// wrapV1InternalRequest 包装请求为 v1internal 格式
+// wrapV1InternalRequest 包装请求为 v1internal 格式（无请求身份上下文时的兼容入口）。
 func (s *AntigravityGatewayService) wrapV1InternalRequest(projectID, model string, originalBody []byte) ([]byte, error) {
-	var request any
+	return s.wrapV1InternalRequestWithContext(context.Background(), projectID, model, originalBody)
+}
+
+// wrapV1InternalRequestWithContext 包装请求为 v1internal 格式，并按真机客户端
+// 结构补全 requestId / labels / sessionId（见 pkg/antigravity/envelope.go）。
+// Gemini 原生链路走这里；Claude 转换链路由 TransformClaudeToGeminiWithOptions 直接生成。
+func (s *AntigravityGatewayService) wrapV1InternalRequestWithContext(ctx context.Context, projectID, model string, originalBody []byte) ([]byte, error) {
+	var request map[string]any
 	if err := json.Unmarshal(originalBody, &request); err != nil {
 		return nil, fmt.Errorf("解析请求体失败: %w", err)
 	}
@@ -747,13 +758,29 @@ func (s *AntigravityGatewayService) wrapV1InternalRequest(projectID, model strin
 		return nil, errAntigravityProjectIDRequired
 	}
 
-	wrapped := map[string]any{
-		"project":     projectID,
-		"requestId":   "agent-" + uuid.New().String(),
-		"userAgent":   "antigravity", // 固定值，与官方客户端一致
-		"requestType": "agent",
-		"model":       model,
-		"request":     request,
+	identity := antigravityWireIdentityFromContext(ctx)
+	envelope := antigravity.BuildWireEnvelope(model, geminiContentsFromBody(request), identity.seed, identity.accountID)
+
+	// 真机请求的 request 内部固定带 sessionId 与 labels。
+	request["sessionId"] = envelope.SessionID
+	request["labels"] = envelope.Labels
+
+	// 用匿名结构体固定顶层键序（project, userAgent, requestType, model, requestId, request），
+	// 与真机抓包一致；map 会被 encoding/json 按字母序重排。
+	wrapped := struct {
+		Project     string         `json:"project"`
+		UserAgent   string         `json:"userAgent"`
+		RequestType string         `json:"requestType"`
+		Model       string         `json:"model"`
+		RequestID   string         `json:"requestId"`
+		Request     map[string]any `json:"request"`
+	}{
+		Project:     projectID,
+		UserAgent:   "antigravity", // 固定值，与官方客户端一致
+		RequestType: "agent",
+		Model:       model,
+		RequestID:   envelope.RequestID,
+		Request:     request,
 	}
 
 	return json.Marshal(wrapped)

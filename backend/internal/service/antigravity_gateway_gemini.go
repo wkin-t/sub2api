@@ -53,6 +53,8 @@ func (s *AntigravityGatewayService) ForwardGemini(ctx context.Context, c *gin.Co
 
 	sessionID := getSessionID(c)
 	prefix := logPrefix(sessionID, account.Name)
+	// wire 身份（agent/trajectory/labels/requestId）按客户端会话 + 服务账号派生。
+	ctx = withAntigravityWireIdentity(ctx, sessionID, account.ID)
 
 	if strings.TrimSpace(originalModel) == "" {
 		return nil, s.writeGoogleError(c, http.StatusBadRequest, "Missing model in URL")
@@ -147,7 +149,7 @@ func (s *AntigravityGatewayService) ForwardGemini(ctx context.Context, c *gin.Co
 	injectedBody = ensureGeminiFunctionCallThoughtSignatures(injectedBody)
 
 	// 包装请求
-	wrappedBody, err := s.wrapV1InternalRequest(projectID, mappedModel, injectedBody)
+	wrappedBody, err := s.wrapV1InternalRequestWithContext(ctx, projectID, mappedModel, injectedBody)
 	if err != nil {
 		return nil, s.writeGoogleError(c, http.StatusInternalServerError, "Failed to build upstream request")
 	}
@@ -210,9 +212,9 @@ func (s *AntigravityGatewayService) ForwardGemini(ctx context.Context, c *gin.Co
 			if fallbackModel != "" && fallbackModel != mappedModel {
 				logger.LegacyPrintf("service.antigravity_gateway", "[Antigravity] Model not found (%s), retrying with fallback model %s (account: %s)", mappedModel, fallbackModel, account.Name)
 
-				fallbackWrapped, err := s.wrapV1InternalRequest(projectID, fallbackModel, injectedBody)
+				fallbackWrapped, err := s.wrapV1InternalRequestWithContext(ctx, projectID, fallbackModel, injectedBody)
 				if err == nil {
-					fallbackReq, err := antigravity.NewAPIRequest(ctx, upstreamAction, accessToken, fallbackWrapped)
+					fallbackReq, err := antigravity.NewAPIRequest(antigravityRequestContext(ctx), upstreamAction, accessToken, fallbackWrapped)
 					if err == nil {
 						fallbackResp, err := s.httpUpstream.Do(fallbackReq, proxyURL, account.ID, account.Concurrency)
 						if err == nil && fallbackResp.StatusCode < 400 {
@@ -256,7 +258,7 @@ func (s *AntigravityGatewayService) ForwardGemini(ctx context.Context, c *gin.Co
 			logger.LegacyPrintf("service.antigravity_gateway", "Antigravity Gemini account %d: detected signature-related 400, retrying with cleaned thought signatures", account.ID)
 
 			cleanedInjectedBody := CleanGeminiNativeThoughtSignatures(injectedBody)
-			retryWrappedBody, wrapErr := s.wrapV1InternalRequest(projectID, mappedModel, cleanedInjectedBody)
+			retryWrappedBody, wrapErr := s.wrapV1InternalRequestWithContext(ctx, projectID, mappedModel, cleanedInjectedBody)
 			if wrapErr == nil {
 				retryResult, retryErr := s.antigravityRetryLoop(antigravityRetryLoopParams{
 					ctx:             ctx,

@@ -6,7 +6,9 @@ import (
 	"compress/flate"
 	"compress/gzip"
 	"context"
+	"crypto/sha256"
 	"crypto/tls"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -558,6 +560,20 @@ func isSupportedGrokCLIVersion(version string) bool {
 		semver.Compare(canonical, minimum) >= 0
 }
 
+// tlsProfileCacheFingerprint 把 ClientHello profile 压成短的稳定指纹，用于 TLS
+// client 缓存键，避免改绑/切换 profile 后复用旧的握手配置。
+func tlsProfileCacheFingerprint(profile *tlsfingerprint.Profile) string {
+	if profile == nil {
+		return "none"
+	}
+	raw := fmt.Sprintf("%s|%v|%v|%v|%v|%v|%v|%v|%v|%v|%t",
+		profile.Name, profile.CipherSuites, profile.Curves, profile.PointFormats,
+		profile.SignatureAlgorithms, profile.ALPNProtocols, profile.SupportedVersions,
+		profile.KeyShareGroups, profile.PSKModes, profile.Extensions, profile.EnableGREASE)
+	sum := sha256.Sum256([]byte(raw))
+	return hex.EncodeToString(sum[:8])
+}
+
 // acquireClientWithTLS 获取或创建带 TLS 指纹的客户端
 func (s *httpUpstreamService) acquireClientWithTLS(proxyURL string, accountID int64, accountConcurrency int, profile *tlsfingerprint.Profile, upstreamProfile service.HTTPUpstreamProfile) (*upstreamClientEntry, error) {
 	return s.getClientEntryWithTLS(proxyURL, accountID, accountConcurrency, profile, upstreamProfile, true, true)
@@ -573,8 +589,10 @@ func (s *httpUpstreamService) getClientEntryWithTLS(proxyURL string, accountID i
 	}
 	settings := s.resolvePoolSettings(isolation, accountConcurrency)
 	settings = s.applyProfilePoolSettings(settings, upstreamProfile)
-	// TLS 指纹客户端使用独立的缓存键，加 "tls:" 前缀
-	cacheKey := "tls:" + buildCacheKey(isolation, proxyKey, accountID, upstreamProtocolModeDefault)
+	// TLS 指纹客户端使用独立的缓存键，加 "tls:" 前缀。
+	// profile 指纹并入 key：账号改绑/切换 profile 时必须新建 TLS client，
+	// 否则会继续复用旧 ClientHello（profile=proxy 隔离模式下还可能跨账号串用）。
+	cacheKey := "tls:" + tlsProfileCacheFingerprint(profile) + ":" + buildCacheKey(isolation, proxyKey, accountID, upstreamProtocolModeDefault)
 	poolKey := buildPoolKey(settings, upstreamProtocolModeDefault) + ":tls"
 
 	now := time.Now()
