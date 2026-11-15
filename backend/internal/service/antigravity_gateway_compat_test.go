@@ -344,16 +344,17 @@ func TestInjectAntigravityGeminiSystemIdentity(t *testing.T) {
 				"tools":             []map[string]any{{"functionDeclarations": []map[string]string{{"name": "example", "description": identity}}}},
 			})
 			require.NoError(t, err)
-			got, err := injectIdentityPatchToGeminiRequest(body)
+			got, err := injectIdentityPatchToGeminiRequest(body, "")
 			require.NoError(t, err)
-			require.Equal(t, "You are an AI agent.", gjson.GetBytes(got, "systemInstruction.parts.2.text").String())
-			require.Equal(t, "preserved", gjson.GetBytes(got, "systemInstruction.parts.2.custom").String())
-			require.Equal(t, mention, gjson.GetBytes(got, "systemInstruction.parts.3.text").String())
-			require.Equal(t, `"You are Codex, based on GPT-6."`, gjson.GetBytes(got, "systemInstruction.parts.4.text").String())
+			// 计费伪 header 清洗后为空，被物理移除，后续下标随之前移。
+			require.Equal(t, "You are an AI agent.", gjson.GetBytes(got, "systemInstruction.parts.1.text").String())
+			require.Equal(t, "preserved", gjson.GetBytes(got, "systemInstruction.parts.1.custom").String())
+			require.Equal(t, mention, gjson.GetBytes(got, "systemInstruction.parts.2.text").String())
+			require.Equal(t, `"You are Codex, based on GPT-6."`, gjson.GetBytes(got, "systemInstruction.parts.3.text").String())
 			for _, field := range []string{"contents", "tools"} {
 				require.JSONEq(t, gjson.GetBytes(body, field).Raw, gjson.GetBytes(got, field).Raw)
 			}
-			again, err := injectIdentityPatchToGeminiRequest(got)
+			again, err := injectIdentityPatchToGeminiRequest(got, "")
 			require.NoError(t, err)
 			require.Equal(t, string(got), string(again))
 		})

@@ -559,6 +559,16 @@ func (s *AntigravityGatewayService) getClaudeTransformOptions(ctx context.Contex
 	return opts
 }
 
+// getIdentityPatchPrompt 返回后台配置的身份提示词；为空表示使用内置默认模板。
+// Claude 转换路径通过 TransformOptions 传入同一来源，Gemini 原生 / 兼容路径也必须
+// 走这里，否则 identity_patch_prompt 只对部分链路生效。
+func (s *AntigravityGatewayService) getIdentityPatchPrompt(ctx context.Context) string {
+	if s.settingService == nil {
+		return ""
+	}
+	return s.settingService.GetIdentityPatchPrompt(ctx)
+}
+
 // antigravityTestMaxOutputTokens leaves a thinking model room to think and still answer a short
 // test prompt. It was 1, so gemini-4-argon / gemini-3.8-flash returned no text at all.
 const antigravityTestMaxOutputTokens = 256
@@ -649,12 +659,20 @@ func extractContentFromSSEResponse(respBody []byte) (string, []TestConnectionIma
 	return strings.Join(texts, ""), images
 }
 
-// injectIdentityPatchToGeminiRequest 为 Gemini 格式请求注入身份提示词
-// 如果请求中已包含 "You are Antigravity" 则不重复注入
-func injectIdentityPatchToGeminiRequest(body []byte) ([]byte, error) {
+// injectIdentityPatchToGeminiRequest 为 Gemini 格式请求注入身份提示词。
+// identityPatch 为空时使用内置默认模板（可被 SUB2API_ANTIGRAVITY_IDENTITY_PROFILE 覆盖），
+// 非空则使用后台 identity_patch_prompt 配置的提示词。
+// 如果请求中已包含 "You are Antigravity" 或本次注入的完整文本则不重复注入。
+func injectIdentityPatchToGeminiRequest(body []byte, identityPatch string) ([]byte, error) {
 	var request map[string]any
 	if err := json.Unmarshal(body, &request); err != nil {
 		return nil, fmt.Errorf("解析 Gemini 请求失败: %w", err)
+	}
+
+	// 解析本次要使用的身份提示词：优先后台配置，空则回退内置默认模板。
+	identityPatch = strings.TrimSpace(identityPatch)
+	if identityPatch == "" {
+		identityPatch = antigravity.GetDefaultIdentityPatch()
 	}
 
 	identityFound := false
@@ -662,20 +680,33 @@ func injectIdentityPatchToGeminiRequest(body []byte) ([]byte, error) {
 	// 检查现有 systemInstruction 是否已包含身份提示词
 	if sysInst, ok := request["systemInstruction"].(map[string]any); ok {
 		if parts, ok := sysInst["parts"].([]any); ok {
+			kept := make([]any, 0, len(parts))
 			for _, part := range parts {
-				if partMap, ok := part.(map[string]any); ok {
-					if text, ok := partMap["text"].(string); ok {
-						neutral := antigravity.NeutralizeSystemIdentity(text)
-						if neutral != text {
-							partMap["text"] = neutral
-							systemChanged = true
-						}
-						if strings.Contains(neutral, "You are Antigravity") {
-							identityFound = true
-						}
-					}
+				partMap, ok := part.(map[string]any)
+				if !ok {
+					kept = append(kept, part)
+					continue
 				}
+				text, ok := partMap["text"].(string)
+				if !ok {
+					kept = append(kept, part)
+					continue
+				}
+				neutral := antigravity.NeutralizeSystemIdentity(text)
+				if neutral != text {
+					systemChanged = true
+					if strings.TrimSpace(neutral) == "" {
+						// 清洗后整段为空：物理移除，避免上游对空 part 报 400
+						continue
+					}
+					partMap["text"] = neutral
+				}
+				if strings.Contains(neutral, "You are Antigravity") || neutral == identityPatch {
+					identityFound = true
+				}
+				kept = append(kept, part)
 			}
+			sysInst["parts"] = kept
 		}
 	}
 	if identityFound {
@@ -684,9 +715,6 @@ func injectIdentityPatchToGeminiRequest(body []byte) ([]byte, error) {
 		}
 		return body, nil
 	}
-
-	// 获取默认身份提示词
-	identityPatch := antigravity.GetDefaultIdentityPatch()
 
 	// 构建新的 systemInstruction
 	newPart := map[string]any{"text": identityPatch}
