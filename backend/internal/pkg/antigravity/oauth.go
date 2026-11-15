@@ -33,6 +33,12 @@ const (
 	// AntigravityUserAgentVersionEnv 是 Antigravity User-Agent 版本号的环境变量名。
 	AntigravityUserAgentVersionEnv = "ANTIGRAVITY_USER_AGENT_VERSION"
 
+	// AntigravityUserAgentEnv 是完整 User-Agent 覆盖的环境变量名。
+	// 设置后原样使用（含括号、分号等官方客户端指纹要素），用于对齐抓包到的
+	// 官方客户端 UA（如 antigravity/cli/<ver> (aidev_client; os_type=...; ...)）。
+	// 注意：UA 与账号类型（IDE/CLI）、模型门控和配额归属相关，改动前先确认。
+	AntigravityUserAgentEnv = "SUB2API_ANTIGRAVITY_USER_AGENT"
+
 	// DefaultUserAgentVersion 是未通过环境变量或后台设置覆盖时使用的默认版本号。
 	DefaultUserAgentVersion = "2.23.0"
 
@@ -72,11 +78,16 @@ var (
 // defaultClientSecret 可通过环境变量 ANTIGRAVITY_OAUTH_CLIENT_SECRET 配置
 var defaultClientSecret = "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"
 
+// fullUserAgentOverride 非空时完全替换 BuildUserAgent 的输出。
+var fullUserAgentOverride string
+
 func init() {
 	// 从环境变量读取版本号，未设置则使用默认值
 	if version := NormalizeUserAgentVersion(os.Getenv(AntigravityUserAgentVersionEnv)); version != "" {
 		defaultUserAgentVersion = version
 	}
+	// 完整 UA 覆盖优先于版本号
+	fullUserAgentOverride = NormalizeFullUserAgent(os.Getenv(AntigravityUserAgentEnv))
 	// 从环境变量读取 client_secret，未设置则使用默认值
 	if secret := os.Getenv(AntigravityOAuthClientSecretEnv); secret != "" {
 		defaultClientSecret = secret
@@ -90,6 +101,15 @@ func NormalizeUserAgentVersion(version string) string {
 		return ""
 	}
 	return version
+}
+
+// NormalizeFullUserAgent 校验完整的 User-Agent 覆盖值：去空白、拒绝换行注入与超长值。
+func NormalizeFullUserAgent(ua string) string {
+	ua = strings.TrimSpace(ua)
+	if ua == "" || len(ua) > 512 || strings.ContainsAny(ua, "\r\n") {
+		return ""
+	}
+	return ua
 }
 
 // GetDefaultUserAgentVersion 返回配置文件/环境变量层面的默认版本号。
@@ -121,7 +141,11 @@ func GetUserAgentVersionForContext(ctx context.Context) string {
 }
 
 // BuildUserAgent 使用指定版本号构造 User-Agent；版本为空或非法时回退默认值。
+// 设置了完整 UA 覆盖（SUB2API_ANTIGRAVITY_USER_AGENT）时优先返回覆盖值。
 func BuildUserAgent(version string) string {
+	if fullUserAgentOverride != "" {
+		return fullUserAgentOverride
+	}
 	if normalized := NormalizeUserAgentVersion(version); normalized != "" {
 		return fmt.Sprintf("antigravity/hub/%s windows/amd64", normalized)
 	}

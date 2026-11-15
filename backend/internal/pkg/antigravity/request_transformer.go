@@ -191,7 +191,9 @@ func TransformClaudeToGeminiWithOptions(claudeReq *ClaudeRequest, projectID, map
 	return json.Marshal(v1Req)
 }
 
-// antigravityIdentity Antigravity identity 提示词
+// antigravityIdentity 是上游历史版本使用的 Antigravity identity 提示词
+// （与 Antigravity-Manager 对齐的 "Advanced Agentic Coding" 变体）。
+// 当前生效的默认值由 identity_profiles.go 按 profile / 文件覆盖决定。
 const antigravityIdentity = `<identity>
 You are Antigravity, a powerful agentic AI coding assistant designed by the Google Deepmind team working on Advanced Agentic Coding.
 You are pair programming with a USER to solve their coding task. The task may require creating a new codebase, modifying or debugging an existing codebase, or simply answering a question.
@@ -202,12 +204,14 @@ This information may or may not be relevant to the coding task, it is up for you
 - **Proactiveness**. As an agent, you are allowed to be proactive, but only in the course of completing the user's task. For example, if the user asks you to add a new component, you can edit the code, verify build and test statuses, and take any other obvious follow-up actions, such as performing additional research. However, avoid surprising the user. For example, if the user asks HOW to approach something, you should answer their question and instead of jumping into editing a file.</communication_style>`
 
 func defaultIdentityPatch(_ string) string {
-	return antigravityIdentity
+	return DefaultIdentityPrompt()
 }
 
-// GetDefaultIdentityPatch 返回默认的 Antigravity 身份提示词
+// GetDefaultIdentityPatch 返回默认的 Antigravity 身份提示词。
+// 可通过 SUB2API_ANTIGRAVITY_IDENTITY_PROFILE / SUB2API_ANTIGRAVITY_IDENTITY_PROMPT_FILE
+// 选择不同的官方客户端变体，见 identity_profiles.go。
 func GetDefaultIdentityPatch() string {
-	return antigravityIdentity
+	return DefaultIdentityPrompt()
 }
 
 // modelInfo 模型信息
@@ -296,19 +300,29 @@ func filterOpenCodePrompt(text string) string {
 }
 
 // The patterns are anchored at the start of a system block on purpose, so user
-// instructions that merely mention Claude, GPT or their vendors are left untouched.
+// instructions that merely mention Claude, GPT, Pi or their vendors are left untouched.
 var systemIdentityOpeners = []*regexp.Regexp{
 	regexp.MustCompile(`(?i)^[ \t\r\n]*You are a Claude agent, built on Anthropic'?s Claude Agent SDK\.?`),
 	regexp.MustCompile(`(?i)^[ \t\r\n]*You are Claude Code, Anthropic'?s official CLI for Claude\.?`),
 	regexp.MustCompile(`(?i)^[ \t\r\n]*You are Codex,? (?:a coding agent |an agent )?based on GPT-[0-9]+(?:\.[0-9]+)*(?:-[a-z0-9]+)*\.?`),
 	regexp.MustCompile(`(?i)^[ \t\r\n]*You are GPT-[0-9]+(?:\.[0-9]+)*(?:-[a-z0-9]+)* running in the Codex CLI\.?`),
+	regexp.MustCompile(`(?i)^[ \t\r\n]*You are (?:an? )?(?:expert )?coding (?:assistant|agent) (?:running|operating|working) inside pi(?:,? a coding agent harness)?\.?`),
+	regexp.MustCompile(`(?i)^[ \t\r\n]*You are Hermes Agent, an intelligent AI assistant created by Nous Research\.?`),
 }
 
-// NeutralizeSystemIdentity removes leading client attribution and rewrites a
-// leading vendor identity sentence, preserving the rest of the system block.
+// NeutralizeSystemIdentity removes leading client attribution, rewrites a
+// leading vendor identity sentence and strips sentences the upstream rejects
+// with a fake 429, preserving the rest of the system block.
 // Only Antigravity forwarding should use this; native Anthropic may require attribution.
 func NeutralizeSystemIdentity(text string) string {
 	text = stripClaudeAttribution(text)
+	text = neutralizeLeadingIdentity(text)
+	return StripUpstreamTriggerSentences(text)
+}
+
+// neutralizeLeadingIdentity rewrites a leading client identity declaration to a
+// neutral sentence; a sentence that only mentions the vendor is left untouched.
+func neutralizeLeadingIdentity(text string) string {
 	for _, re := range systemIdentityOpeners {
 		if loc := re.FindStringIndex(text); loc != nil {
 			if strings.HasPrefix(text[loc[1]:], ",") {
