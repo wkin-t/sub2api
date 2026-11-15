@@ -132,6 +132,8 @@ ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now();
   （Claude 转换链路由结构体字段顺序保证；Gemini 原生链路经 map 重排，暂未完全对齐）。
 - 真机样本**没有 `toolConfig`**，sub2api 恒发 `mode=VALIDATED`（上游历史验证为「不带会 400」），
   这里保留现状，属于已知差异。
+- 控制面请求（`setUserSettings` / `fetchUserInfo`）已移除多余的 `X-Goog-Api-Client: gl-node/…`
+  （Node 指纹，官方 Go 客户端不发）。
 
 本分支实现（`backend/internal/pkg/antigravity/envelope.go` + `service/antigravity_wire_identity.go`）：
 
