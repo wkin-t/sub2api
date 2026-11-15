@@ -20,6 +20,10 @@ func testContents(texts ...string) []GeminiContent {
 	return contents
 }
 
+func testIdentity(seed string, accountID int64) WireIdentity {
+	return WireIdentity{ConversationSeed: seed, AccountID: accountID}
+}
+
 func TestOfficialSessionIDIsFNV1a64OfEmptyString(t *testing.T) {
 	// 0xcbf29ce484222325 as a signed int64.
 	require.Equal(t, "-3750763034362895579", OfficialAntigravitySessionID)
@@ -27,7 +31,7 @@ func TestOfficialSessionIDIsFNV1a64OfEmptyString(t *testing.T) {
 }
 
 func TestBuildWireEnvelope_OfficialFormat(t *testing.T) {
-	env := BuildWireEnvelope("gemini-3.7-flash-high", testContents("hello", "world", "again"), "session-1", 42)
+	env := BuildWireEnvelope("gemini-3.7-flash-high", testContents("hello", "world", "again"), testIdentity("session-1", 42), "system")
 
 	require.Regexp(t, `^agent/[0-9a-f-]{36}/3$`, env.RequestID)
 	require.Equal(t, OfficialAntigravitySessionID, env.SessionID)
@@ -37,12 +41,27 @@ func TestBuildWireEnvelope_OfficialFormat(t *testing.T) {
 	require.Equal(t, "false", env.Labels["used_non_gemini_model"])
 	require.Regexp(t, `^[0-9a-f-]{36}$`, env.Labels["trajectory_id"])
 	require.Contains(t, env.Labels["request_id"], env.Labels["trajectory_id"]+"-")
+	// hub 形态按 Windows 原生客户端抓包保持 8 个 label，没有 cascade/client 组。
 	require.NotContains(t, env.Labels, "cascade_id")
 	require.NotContains(t, env.Labels, "root_cascade_id")
+	require.NotContains(t, env.Labels, "client")
+}
+
+func TestBuildWireEnvelope_AGYCLILabels(t *testing.T) {
+	previous := antigravityUserAgentProfile
+	antigravityUserAgentProfile = userAgentFamilyAGYCLI
+	t.Cleanup(func() { antigravityUserAgentProfile = previous })
+
+	env := BuildWireEnvelope("gemini-3.7-flash-high", testContents("hello"), testIdentity("session-1", 42), "system")
+
+	require.Equal(t, "antigravity-cli", env.Labels["client"])
+	require.Regexp(t, `^[0-9a-f-]{36}$`, env.Labels["conversation_id"])
+	require.Equal(t, env.Labels["conversation_id"], env.Labels["cascade_id"])
+	require.Equal(t, env.Labels["conversation_id"], env.Labels["root_cascade_id"])
 }
 
 func TestBuildWireEnvelope_ClaudeLabels(t *testing.T) {
-	env := BuildWireEnvelope("claude-sonnet-4-6", testContents("hello"), "session-1", 42)
+	env := BuildWireEnvelope("claude-sonnet-4-6", testContents("hello"), testIdentity("session-1", 42), "system")
 
 	require.Equal(t, "MODEL_PLACEHOLDER_M35", env.Labels["model_enum"])
 	require.Equal(t, "true", env.Labels["used_claude"])
@@ -53,26 +72,30 @@ func TestBuildWireEnvelope_ClaudeLabels(t *testing.T) {
 
 func TestBuildWireEnvelope_IdentityIsStablePerConversationAndAccount(t *testing.T) {
 	contents := testContents("hello", "answer", "next")
-	first := BuildWireEnvelope("gemini-3.7-flash-high", contents, "session-1", 42)
-	second := BuildWireEnvelope("gemini-3.7-flash-high", contents, "session-1", 42)
+	first := BuildWireEnvelope("gemini-3.7-flash-high", contents, testIdentity("session-1", 42), "system")
+	second := BuildWireEnvelope("gemini-3.7-flash-high", contents, testIdentity("session-1", 42), "system")
 	require.Equal(t, first.RequestID, second.RequestID)
 	require.Equal(t, first.Labels["trajectory_id"], second.Labels["trajectory_id"])
 
 	// A different account must not reuse the same cascade (would link accounts).
-	otherAccount := BuildWireEnvelope("gemini-3.7-flash-high", contents, "session-1", 43)
+	otherAccount := BuildWireEnvelope("gemini-3.7-flash-high", contents, testIdentity("session-1", 43), "system")
 	require.NotEqual(t, first.RequestID, otherAccount.RequestID)
 	require.NotEqual(t, first.Labels["trajectory_id"], otherAccount.Labels["trajectory_id"])
 
 	// A different conversation gets a different identity as well.
-	otherConversation := BuildWireEnvelope("gemini-3.7-flash-high", contents, "session-2", 42)
+	otherConversation := BuildWireEnvelope("gemini-3.7-flash-high", contents, testIdentity("session-2", 42), "system")
 	require.NotEqual(t, first.RequestID, otherConversation.RequestID)
 }
 
-func TestBuildWireEnvelope_DerivesSeedWhenNoSessionHeader(t *testing.T) {
-	contents := testContents("first user text", "answer", "follow up")
-	a := BuildWireEnvelope("gemini-3.7-flash-high", contents, "", 42)
-	b := BuildWireEnvelope("gemini-3.7-flash-high", contents, "", 42)
-	require.Equal(t, a.RequestID, b.RequestID)
+func TestBuildWireEnvelope_SeparatesConversationsWithSameOpeningMessage(t *testing.T) {
+	contents := testContents("same opening message")
+	first := BuildWireEnvelope("gemini-3.7-flash-high", contents, testIdentity("", 42), "system prompt A")
+	second := BuildWireEnvelope("gemini-3.7-flash-high", contents, testIdentity("", 42), "system prompt B")
+	require.NotEqual(t, first.RequestID, second.RequestID)
+
+	// Without a session header the identity must stay stable across turns.
+	third := BuildWireEnvelope("gemini-3.7-flash-high", contents, testIdentity("", 42), "system prompt A")
+	require.Equal(t, first.RequestID, third.RequestID)
 }
 
 func TestSessionIDModes(t *testing.T) {
@@ -100,7 +123,9 @@ func TestTransformClaudeToGemini_WireEnvelope(t *testing.T) {
 		},
 	}
 
-	body, err := TransformClaudeToGeminiWithOptions(req, "project", "gemini-3.7-flash-high", TransformOptions{ConversationSeed: "seed", AccountID: 7})
+	body, err := TransformClaudeToGeminiWithOptions(req, "project", "gemini-3.7-flash-high", TransformOptions{
+		WireIdentity: testIdentity("seed", 7),
+	})
 	require.NoError(t, err)
 
 	// Envelope keys must appear in the real client's order.
@@ -126,6 +151,24 @@ func TestTransformClaudeToGemini_WireEnvelope(t *testing.T) {
 	require.Contains(t, string(inner["labels"]), `"trajectory_id":"`)
 	require.Contains(t, string(inner["labels"]), `"request_id":"`)
 	require.Contains(t, string(inner["labels"]), `"last_step_index":"2"`)
+}
+
+func TestWrapGeminiRequest_InjectsIdentityAndPreservesUnknownFields(t *testing.T) {
+	body := []byte(`{"contents":[{"role":"user","parts":[{"text":"hello"}]}],"systemInstruction":{"parts":[{"text":"sys"}]},"cachedContent":"keep-me"}`)
+
+	wrapped, err := WrapGeminiRequest("project", "agent", "gemini-3.7-flash-high", body, testIdentity("session-1", 42))
+	require.NoError(t, err)
+
+	var raw map[string]json.RawMessage
+	require.NoError(t, json.Unmarshal(wrapped, &raw))
+	require.Regexp(t, `^agent/[0-9a-f-]{36}/1$`, gjsonString(t, raw["requestId"]))
+
+	var inner map[string]json.RawMessage
+	require.NoError(t, json.Unmarshal(raw["request"], &inner))
+	require.Contains(t, string(inner["sessionId"]), OfficialAntigravitySessionID)
+	require.Contains(t, string(inner["labels"]), `"model_enum":"MODEL_PLACEHOLDER_M298"`)
+	require.Equal(t, `"keep-me"`, string(inner["cachedContent"]))
+	require.Contains(t, string(inner["systemInstruction"]), "sys")
 }
 
 func gjsonString(t *testing.T, raw json.RawMessage) string {

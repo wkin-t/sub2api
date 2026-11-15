@@ -2,7 +2,6 @@ package service
 
 import (
 	"context"
-	"encoding/json"
 	"log"
 	"os"
 	"strings"
@@ -17,28 +16,23 @@ import (
 // The real client mints its cascade identity per app instance; a relay must not
 // reuse one identity across several OAuth accounts because the upstream would
 // then associate those accounts with one client.
-type antigravityWireIdentity struct {
-	seed      string
-	accountID int64
-}
-
 type antigravityWireIdentityContextKey struct{}
 
 func withAntigravityWireIdentity(ctx context.Context, seed string, accountID int64) context.Context {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	return context.WithValue(ctx, antigravityWireIdentityContextKey{}, antigravityWireIdentity{
-		seed:      strings.TrimSpace(seed),
-		accountID: accountID,
+	return context.WithValue(ctx, antigravityWireIdentityContextKey{}, antigravity.WireIdentity{
+		ConversationSeed: strings.TrimSpace(seed),
+		AccountID:        accountID,
 	})
 }
 
-func antigravityWireIdentityFromContext(ctx context.Context) antigravityWireIdentity {
+func antigravityWireIdentityFromContext(ctx context.Context) antigravity.WireIdentity {
 	if ctx == nil {
-		return antigravityWireIdentity{}
+		return antigravity.WireIdentity{}
 	}
-	identity, _ := ctx.Value(antigravityWireIdentityContextKey{}).(antigravityWireIdentity)
+	identity, _ := ctx.Value(antigravityWireIdentityContextKey{}).(antigravity.WireIdentity)
 	return identity
 }
 
@@ -51,8 +45,10 @@ func antigravityWireSeed(c *gin.Context) string {
 }
 
 // antigravityHTTP2Enabled reports whether Antigravity inference should speak
-// HTTP/2 like the official Go client (ALPN h2,http/1.1). Default on; set
-// SUB2API_ANTIGRAVITY_HTTP2=0/false/off to keep HTTP/1.1.
+// HTTP/2 like the official Go client (ALPN h2,http/1.1).
+//
+// This is a deliberate transport change (the official client is h2), so it
+// defaults to on; set SUB2API_ANTIGRAVITY_HTTP2=0/false/off to keep HTTP/1.1.
 var antigravityHTTP2Enabled = resolveAntigravityHTTP2()
 
 func resolveAntigravityHTTP2() bool {
@@ -76,22 +72,4 @@ func antigravityRequestContext(ctx context.Context) context.Context {
 		return ctx
 	}
 	return WithHTTPUpstreamProfile(ctx, HTTPUpstreamProfileLongStream)
-}
-
-// geminiContentsFromBody extracts the contents array of a raw Gemini request
-// for wire-envelope step/request counting.
-func geminiContentsFromBody(request map[string]any) []antigravity.GeminiContent {
-	raw, ok := request["contents"]
-	if !ok || raw == nil {
-		return nil
-	}
-	data, err := json.Marshal(raw)
-	if err != nil {
-		return nil
-	}
-	var contents []antigravity.GeminiContent
-	if err := json.Unmarshal(data, &contents); err != nil {
-		return nil
-	}
-	return contents
 }

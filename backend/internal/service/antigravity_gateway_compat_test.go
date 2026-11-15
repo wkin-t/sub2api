@@ -295,21 +295,21 @@ func TestAntigravitySystemIdentityMultipleBlocksForward(test *testing.T) {
 						systemTexts = append(systemTexts, part.Get("text").String())
 					}
 					require.NotEmpty(test, systemTexts)
+					// 所有场景（包括客户端已带 Antigravity 身份）都会注入本次配置的身份段，
+					// 客户端原有身份声明被 NeutralizeSystemIdentity 改写为中性句。
 					wantTexts := append([]string{}, texts...)
 					for index, text := range wantTexts {
-						if text == stale || text == otherStale {
+						if text == stale || text == otherStale || strings.Contains(text, "You are Antigravity") {
 							wantTexts[index] = "You are an AI agent."
 						}
 					}
-					if scenario.name != "native_then_stale" {
-						require.Contains(test, systemTexts[0], "You are Antigravity")
-						systemTexts = systemTexts[1:]
-						if protocol == "messages" {
-							require.GreaterOrEqual(test, len(systemTexts), 2)
-							require.Contains(test, systemTexts[0], "Below are your system instructions.")
-							require.Equal(test, "\n--- [SYSTEM_PROMPT_END] ---", systemTexts[len(systemTexts)-1])
-							systemTexts = systemTexts[1 : len(systemTexts)-1]
-						}
+					require.Contains(test, systemTexts[0], "You are Antigravity")
+					systemTexts = systemTexts[1:]
+					if protocol == "messages" {
+						require.GreaterOrEqual(test, len(systemTexts), 2)
+						require.Contains(test, systemTexts[0], "Below are your system instructions.")
+						require.Equal(test, "\n--- [SYSTEM_PROMPT_END] ---", systemTexts[len(systemTexts)-1])
+						systemTexts = systemTexts[1 : len(systemTexts)-1]
 					}
 					separator := "\n\n"
 					if protocol == "messages" {
@@ -347,11 +347,19 @@ func TestInjectAntigravityGeminiSystemIdentity(t *testing.T) {
 			require.NoError(t, err)
 			got, err := injectIdentityPatchToGeminiRequest(body, "")
 			require.NoError(t, err)
-			// 计费伪 header 清洗后为空，被物理移除，后续下标随之前移。
-			require.Equal(t, "You are an AI agent.", gjson.GetBytes(got, "systemInstruction.parts.1.text").String())
-			require.Equal(t, "preserved", gjson.GetBytes(got, "systemInstruction.parts.1.custom").String())
-			require.Equal(t, mention, gjson.GetBytes(got, "systemInstruction.parts.2.text").String())
-			require.Equal(t, `"You are Codex, based on GPT-6."`, gjson.GetBytes(got, "systemInstruction.parts.3.text").String())
+			// 注入的官方身份段排在首位。
+			require.Equal(t, antigravity.GetDefaultIdentityPatch(), gjson.GetBytes(got, "systemInstruction.parts.0.text").String())
+			// 计费伪 header 与客户端身份都被中和；找到保留 custom 字段的那个 part。
+			preservedIndex := -1
+			for index, part := range gjson.GetBytes(got, "systemInstruction.parts").Array() {
+				if part.Get("custom").String() == "preserved" {
+					preservedIndex = index
+					require.Equal(t, "You are an AI agent.", part.Get("text").String())
+				}
+			}
+			require.NotEqual(t, -1, preservedIndex)
+			require.Equal(t, mention, gjson.GetBytes(got, fmt.Sprintf("systemInstruction.parts.%d.text", preservedIndex+1)).String())
+			require.Equal(t, `"You are Codex, based on GPT-6."`, gjson.GetBytes(got, fmt.Sprintf("systemInstruction.parts.%d.text", preservedIndex+2)).String())
 			for _, field := range []string{"contents", "tools"} {
 				require.JSONEq(t, gjson.GetBytes(body, field).Raw, gjson.GetBytes(got, field).Raw)
 			}

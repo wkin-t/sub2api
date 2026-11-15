@@ -395,9 +395,9 @@ func (s *AntigravityGatewayService) TestConnectionWithPrompt(ctx context.Context
 	// 构建请求体
 	var requestBody []byte
 	if shouldUseAntigravityGeminiTestRequest(modelID, mappedModel) {
-		requestBody, err = s.buildGeminiTestRequestWithPrompt(projectID, mappedModel, prompt)
+		requestBody, err = s.buildGeminiTestRequestWithPrompt(ctx, projectID, mappedModel, prompt)
 	} else {
-		requestBody, err = s.buildClaudeTestRequest(projectID, mappedModel, prompt)
+		requestBody, err = s.buildClaudeTestRequest(ctx, projectID, mappedModel, prompt)
 	}
 	if err != nil {
 		return nil, fmt.Errorf("构建请求失败: %w", err)
@@ -470,7 +470,7 @@ func testConnectionHandleError(
 
 // buildGeminiTestRequestWithPrompt 构建 Gemini 格式测试请求
 // 文本模型使用最小 token 消耗：输入 "." + maxOutputTokens: 1；图片模型使用图片生成配置
-func (s *AntigravityGatewayService) buildGeminiTestRequestWithPrompt(projectID, model, prompt string) ([]byte, error) {
+func (s *AntigravityGatewayService) buildGeminiTestRequestWithPrompt(ctx context.Context, projectID, model, prompt string) ([]byte, error) {
 	if isImageGenerationModel(model) {
 		imagePrompt := strings.TrimSpace(prompt)
 		if imagePrompt == "" {
@@ -498,7 +498,7 @@ func (s *AntigravityGatewayService) buildGeminiTestRequestWithPrompt(projectID, 
 			},
 		}
 		payloadBytes, _ := json.Marshal(payload)
-		return s.wrapV1InternalRequest(projectID, model, payloadBytes)
+		return s.wrapV1InternalRequestWithContext(ctx, projectID, model, payloadBytes)
 	}
 
 	payload := map[string]any{
@@ -526,12 +526,12 @@ func (s *AntigravityGatewayService) buildGeminiTestRequestWithPrompt(projectID, 
 		},
 	}
 	payloadBytes, _ := json.Marshal(payload)
-	return s.wrapV1InternalRequest(projectID, model, payloadBytes)
+	return s.wrapV1InternalRequestWithContext(ctx, projectID, model, payloadBytes)
 }
 
 // buildClaudeTestRequest 构建 Claude 格式测试请求并转换为 Gemini 格式
 // 与其他平台一致：发送管理员输入的提示词（默认 "hi"），留出足够的输出 token 以便模型回答。
-func (s *AntigravityGatewayService) buildClaudeTestRequest(projectID, mappedModel, prompt string) ([]byte, error) {
+func (s *AntigravityGatewayService) buildClaudeTestRequest(ctx context.Context, projectID, mappedModel, prompt string) ([]byte, error) {
 	content, err := json.Marshal(antigravityTestPrompt(prompt))
 	if err != nil {
 		return nil, err
@@ -547,14 +547,14 @@ func (s *AntigravityGatewayService) buildClaudeTestRequest(projectID, mappedMode
 		MaxTokens: antigravityTestMaxOutputTokens,
 		Stream:    false,
 	}
-	return antigravity.TransformClaudeToGemini(claudeReq, projectID, mappedModel)
+	opts := antigravity.DefaultTransformOptions()
+	opts.WireIdentity = antigravityWireIdentityFromContext(ctx)
+	return antigravity.TransformClaudeToGeminiWithOptions(claudeReq, projectID, mappedModel, opts)
 }
 
 func (s *AntigravityGatewayService) getClaudeTransformOptions(ctx context.Context) antigravity.TransformOptions {
 	opts := antigravity.DefaultTransformOptions()
-	identity := antigravityWireIdentityFromContext(ctx)
-	opts.ConversationSeed = identity.seed
-	opts.AccountID = identity.accountID
+	opts.WireIdentity = antigravityWireIdentityFromContext(ctx)
 	if s.settingService == nil {
 		return opts
 	}
@@ -666,7 +666,8 @@ func extractContentFromSSEResponse(respBody []byte) (string, []TestConnectionIma
 // injectIdentityPatchToGeminiRequest 为 Gemini 格式请求注入身份提示词。
 // identityPatch 为空时使用内置默认模板（可被 SUB2API_ANTIGRAVITY_IDENTITY_PROFILE 覆盖），
 // 非空则使用后台 identity_patch_prompt 配置的提示词。
-// 如果请求中已包含 "You are Antigravity" 或本次注入的完整文本则不重复注入。
+// 幂等：若首个 part 已经等于本次要注入的完整文本，则不再重复注入。
+// 客户端自带的其它身份声明会被 NeutralizeSystemIdentity 重写，从而实现「只替换身份段」。
 func injectIdentityPatchToGeminiRequest(body []byte, identityPatch string) ([]byte, error) {
 	var request map[string]any
 	if err := json.Unmarshal(body, &request); err != nil {
@@ -696,6 +697,14 @@ func injectIdentityPatchToGeminiRequest(body []byte, identityPatch string) ([]by
 					kept = append(kept, part)
 					continue
 				}
+				// 先识别「本函数自己注入过的完整身份文本」，再走清洗，
+				// 否则官方身份 patch 里的 "You are Antigravity" 会被重写，
+				// 导致重复注入（幂等性要求）。
+				if strings.TrimSpace(text) == identityPatch {
+					identityFound = true
+					kept = append(kept, part)
+					continue
+				}
 				neutral := antigravity.NeutralizeSystemIdentity(text)
 				if neutral != text {
 					systemChanged = true
@@ -704,9 +713,6 @@ func injectIdentityPatchToGeminiRequest(body []byte, identityPatch string) ([]by
 						continue
 					}
 					partMap["text"] = neutral
-				}
-				if strings.Contains(neutral, "You are Antigravity") || neutral == identityPatch {
-					identityFound = true
 				}
 				kept = append(kept, part)
 			}
@@ -738,52 +744,6 @@ func injectIdentityPatchToGeminiRequest(body []byte, identityPatch string) ([]by
 	}
 
 	return json.Marshal(request)
-}
-
-// wrapV1InternalRequest 包装请求为 v1internal 格式（无请求身份上下文时的兼容入口）。
-func (s *AntigravityGatewayService) wrapV1InternalRequest(projectID, model string, originalBody []byte) ([]byte, error) {
-	return s.wrapV1InternalRequestWithContext(context.Background(), projectID, model, originalBody)
-}
-
-// wrapV1InternalRequestWithContext 包装请求为 v1internal 格式，并按真机客户端
-// 结构补全 requestId / labels / sessionId（见 pkg/antigravity/envelope.go）。
-// Gemini 原生链路走这里；Claude 转换链路由 TransformClaudeToGeminiWithOptions 直接生成。
-func (s *AntigravityGatewayService) wrapV1InternalRequestWithContext(ctx context.Context, projectID, model string, originalBody []byte) ([]byte, error) {
-	var request map[string]any
-	if err := json.Unmarshal(originalBody, &request); err != nil {
-		return nil, fmt.Errorf("解析请求体失败: %w", err)
-	}
-	projectID = strings.TrimSpace(projectID)
-	if projectID == "" {
-		return nil, errAntigravityProjectIDRequired
-	}
-
-	identity := antigravityWireIdentityFromContext(ctx)
-	envelope := antigravity.BuildWireEnvelope(model, geminiContentsFromBody(request), identity.seed, identity.accountID)
-
-	// 真机请求的 request 内部固定带 sessionId 与 labels。
-	request["sessionId"] = envelope.SessionID
-	request["labels"] = envelope.Labels
-
-	// 用匿名结构体固定顶层键序（project, userAgent, requestType, model, requestId, request），
-	// 与真机抓包一致；map 会被 encoding/json 按字母序重排。
-	wrapped := struct {
-		Project     string         `json:"project"`
-		UserAgent   string         `json:"userAgent"`
-		RequestType string         `json:"requestType"`
-		Model       string         `json:"model"`
-		RequestID   string         `json:"requestId"`
-		Request     map[string]any `json:"request"`
-	}{
-		Project:     projectID,
-		UserAgent:   "antigravity", // 固定值，与官方客户端一致
-		RequestType: "agent",
-		Model:       model,
-		RequestID:   envelope.RequestID,
-		Request:     request,
-	}
-
-	return json.Marshal(wrapped)
 }
 
 // unwrapV1InternalResponse 解包 v1internal 响应

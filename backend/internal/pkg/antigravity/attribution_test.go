@@ -71,9 +71,11 @@ func TestTransformClaudeToGemini_AttributionSystemText(t *testing.T) {
 				var got V1InternalRequest
 				require.NoError(t, json.Unmarshal(body, &got))
 				var texts []string
-				for _, part := range got.Request.SystemInstruction.Parts {
-					if part.Text != "\n--- [SYSTEM_PROMPT_END] ---" {
-						texts = append(texts, part.Text)
+				if got.Request.SystemInstruction != nil {
+					for _, part := range got.Request.SystemInstruction.Parts {
+						if part.Text != "\n--- [SYSTEM_PROMPT_END] ---" {
+							texts = append(texts, part.Text)
+						}
 					}
 				}
 				var want []string
@@ -95,13 +97,23 @@ func TestTransformClaudeToGemini_AttributionSystemText(t *testing.T) {
 	}
 }
 
-func TestTransformClaudeToGemini_AttributionDoesNotHideIdentity(t *testing.T) {
+func TestTransformClaudeToGemini_ReplacesClientAntigravityIdentity(t *testing.T) {
 	system, err := json.Marshal("x-anthropic-billing-header: cc_version=example;\nYou are Antigravity. Keep this identity.")
 	require.NoError(t, err)
 	got := buildSystemInstruction(system, "gemini-3.8-flash-high", DefaultTransformOptions(), nil)
-	require.Len(t, got.Parts, 1)
-	require.Equal(t, "You are Antigravity. Keep this identity.", got.Parts[0].Text)
-	require.False(t, strings.Contains(got.Parts[0].Text, "cc_version="))
+	require.NotNil(t, got)
+
+	var text strings.Builder
+	for _, part := range got.Parts {
+		text.WriteString(part.Text)
+		text.WriteString("\n")
+	}
+	// 身份段被替换为本次配置的官方身份，客户端自带的 Antigravity 声明被中和。
+	require.False(t, strings.Contains(text.String(), "cc_version="))
+	require.False(t, strings.Contains(text.String(), "Keep this identity"))
+	require.True(t, strings.Contains(text.String(), "You are an AI agent."))
+	// 注入的身份提示词仍然排在首位。
+	require.Contains(t, got.Parts[0].Text, "You are Antigravity")
 }
 
 func TestNeutralizeClaudeIdentity(t *testing.T) {

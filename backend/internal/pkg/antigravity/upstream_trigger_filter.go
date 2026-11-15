@@ -25,14 +25,16 @@ import (
 //     context: ..." sentence (sub2api #8824, PR #8829)
 //
 // Client identity openers that start a system block (Claude Agent SDK, Claude
-// Code, Codex, Pi, Hermes, ...) are rewritten by systemIdentityOpeners in
+// Code, Codex, Pi, ...) are rewritten by systemIdentityOpeners in
 // request_transformer.go; this filter catches trigger sentences that can
-// appear anywhere inside a block.
+// appear anywhere inside a block. Hermes is only handled here (its opener was
+// removed from systemIdentityOpeners to avoid rewriting the same line twice).
 const stripPatternsEnv = "SUB2API_ANTIGRAVITY_STRIP_PATTERNS"
 
 var defaultUpstreamTriggerPatterns = []string{
 	`(?i)You are Hermes Agent, an intelligent AI assistant created by Nous Research\.?[ \t]*`,
-	`(?i)Dual-use security tools \([^)]*\) require clear authorization context:[^.\n]*\.[ \t]*`,
+	// 句号可选：触发句被改成无标点/换行结尾时同样要命中。
+	`(?i)Dual-use security tools \([^)]*\) require clear authorization context:[^.\n]*\.?[ \t]*`,
 }
 
 var upstreamTriggerPatterns = compileUpstreamTriggerPatterns(os.Getenv(stripPatternsEnv))

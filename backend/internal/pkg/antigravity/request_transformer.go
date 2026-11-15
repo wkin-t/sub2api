@@ -1,44 +1,14 @@
 package antigravity
 
 import (
-	"crypto/sha256"
-	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"log"
-	"math/rand"
 	"regexp"
-	"strconv"
 	"strings"
-	"sync"
-	"time"
 
 	"github.com/Wei-Shaw/sub2api/internal/pkg/gemini"
 )
-
-var (
-	sessionRand      = rand.New(rand.NewSource(time.Now().UnixNano()))
-	sessionRandMutex sync.Mutex
-)
-
-// generateStableSessionID 基于用户消息内容生成稳定的 session ID
-func generateStableSessionID(contents []GeminiContent) string {
-	// 查找第一个 user 消息的文本
-	for _, content := range contents {
-		if content.Role == "user" && len(content.Parts) > 0 {
-			if text := content.Parts[0].Text; text != "" {
-				h := sha256.Sum256([]byte(text))
-				n := int64(binary.BigEndian.Uint64(h[:8])) & 0x7FFFFFFFFFFFFFFF
-				return "-" + strconv.FormatInt(n, 10)
-			}
-		}
-	}
-	// 回退：生成随机 session ID
-	sessionRandMutex.Lock()
-	n := sessionRand.Int63n(9_000_000_000_000_000_000)
-	sessionRandMutex.Unlock()
-	return "-" + strconv.FormatInt(n, 10)
-}
 
 type TransformOptions struct {
 	EnableIdentityPatch bool
@@ -46,12 +16,9 @@ type TransformOptions struct {
 	// 为空时使用默认模板（包含 [IDENTITY_PATCH] 及 SYSTEM_PROMPT_BEGIN 标记）。
 	IdentityPatch string
 	EnableMCPXML  bool
-	// ConversationSeed 是调用方提供的会话种子（通常是客户端 session id）；
-	// 为空时由请求内容派生。用于生成稳定的 agent/trajectory 身份。
-	ConversationSeed string
-	// AccountID 是本次请求实际使用的服务账号，用于把 wire 身份限定在账号内，
-	// 避免同一 cascade 出现在多个 OAuth 账号上（上游会把它们视为同一客户端）。
-	AccountID int64
+	// WireIdentity 是调用方提供的会话种子与账号作用域，用于生成稳定的
+	// agent/trajectory 身份（见 envelope.go）。
+	WireIdentity WireIdentity
 }
 
 func DefaultTransformOptions() TransformOptions {
@@ -154,7 +121,9 @@ func TransformClaudeToGeminiWithOptions(claudeReq *ClaudeRequest, projectID, map
 	// 请求身份（sessionId / labels / requestId）按真机客户端的 wire 结构生成，
 	// 见 envelope.go：sessionId 是官方常量，requestId 为 agent/<agentId>/<step>，
 	// labels 携带 trajectory / request / model_enum 等字段。
-	envelope := BuildWireEnvelope(targetModel, contents, opts.ConversationSeed, opts.AccountID)
+	// systemInstruction 文本参与会话种子，避免不同会话在首条用户消息相同时
+	// 撞到同一个 agent/trajectory 身份。
+	envelope := BuildWireEnvelope(targetModel, contents, opts.WireIdentity, SystemInstructionText(systemInstruction))
 	innerRequest := GeminiRequest{
 		Contents:  contents,
 		SessionID: envelope.SessionID,
@@ -311,13 +280,17 @@ func filterOpenCodePrompt(text string) string {
 
 // The patterns are anchored at the start of a system block on purpose, so user
 // instructions that merely mention Claude, GPT, Pi or their vendors are left untouched.
+// Hermes is intentionally absent: its trigger sentence is removed by
+// upstream_trigger_filter.go so the two mechanisms do not rewrite the same line.
 var systemIdentityOpeners = []*regexp.Regexp{
 	regexp.MustCompile(`(?i)^[ \t\r\n]*You are a Claude agent, built on Anthropic'?s Claude Agent SDK\.?`),
 	regexp.MustCompile(`(?i)^[ \t\r\n]*You are Claude Code, Anthropic'?s official CLI for Claude\.?`),
 	regexp.MustCompile(`(?i)^[ \t\r\n]*You are Codex,? (?:a coding agent |an agent )?based on GPT-[0-9]+(?:\.[0-9]+)*(?:-[a-z0-9]+)*\.?`),
 	regexp.MustCompile(`(?i)^[ \t\r\n]*You are GPT-[0-9]+(?:\.[0-9]+)*(?:-[a-z0-9]+)* running in the Codex CLI\.?`),
 	regexp.MustCompile(`(?i)^[ \t\r\n]*You are (?:an? )?(?:expert )?coding (?:assistant|agent) (?:running|operating|working) inside pi(?:,? a coding agent harness)?\.?`),
-	regexp.MustCompile(`(?i)^[ \t\r\n]*You are Hermes Agent, an intelligent AI assistant created by Nous Research\.?`),
+	// 客户端已带 Antigravity 身份时也重写成本次配置的身份段（用户要求：只替换身份段）。
+	regexp.MustCompile(`(?i)^[ \t\r\n]*You are Antigravity,?[^\n]*?(?:assistant|Agentic Coding)[^\n]*?\.?`),
+	regexp.MustCompile(`(?i)^[ \t\r\n]*You are Antigravity[^\n]*\.?`),
 }
 
 // NeutralizeSystemIdentity removes leading client attribution, rewrites a
@@ -367,8 +340,9 @@ func stripClaudeAttribution(text string) string {
 func buildSystemInstruction(system json.RawMessage, modelName string, opts TransformOptions, tools []ClaudeTool) *GeminiContent {
 	var parts []GeminiPart
 
-	// 先解析用户的 system prompt，检测是否已包含 Antigravity identity
-	userHasAntigravityIdentity := false
+	// 先解析用户的 system prompt。开头的客户端/厂商身份声明（含已有 Antigravity
+	// 身份）会被 NeutralizeSystemIdentity 重写，下面再注入本次配置的身份段，
+	// 从而做到「只替换身份段」而不是整段保留。
 	var userSystemParts []GeminiPart
 
 	if len(system) > 0 {
@@ -377,9 +351,6 @@ func buildSystemInstruction(system json.RawMessage, modelName string, opts Trans
 		if err := json.Unmarshal(system, &sysStr); err == nil {
 			sysStr = NeutralizeSystemIdentity(sysStr)
 			if strings.TrimSpace(sysStr) != "" {
-				if strings.Contains(sysStr, "You are Antigravity") {
-					userHasAntigravityIdentity = true
-				}
 				// 过滤 OpenCode 默认提示词
 				filtered := filterOpenCodePrompt(sysStr)
 				if filtered != "" {
@@ -393,9 +364,6 @@ func buildSystemInstruction(system json.RawMessage, modelName string, opts Trans
 				for _, block := range sysBlocks {
 					block.Text = NeutralizeSystemIdentity(block.Text)
 					if block.Type == "text" && strings.TrimSpace(block.Text) != "" {
-						if strings.Contains(block.Text, "You are Antigravity") {
-							userHasAntigravityIdentity = true
-						}
 						// 过滤 OpenCode 默认提示词
 						filtered := filterOpenCodePrompt(block.Text)
 						if filtered != "" {
@@ -407,8 +375,8 @@ func buildSystemInstruction(system json.RawMessage, modelName string, opts Trans
 		}
 	}
 
-	// 仅在用户未提供 Antigravity identity 时注入
-	if opts.EnableIdentityPatch && !userHasAntigravityIdentity {
+	// 注入配置的身份段（Antigravity 转发路径强制开启）。
+	if opts.EnableIdentityPatch {
 		identityPatch := strings.TrimSpace(opts.IdentityPatch)
 		if identityPatch == "" {
 			identityPatch = defaultIdentityPatch(modelName)
@@ -428,8 +396,8 @@ func buildSystemInstruction(system json.RawMessage, modelName string, opts Trans
 		parts = append(parts, GeminiPart{Text: mcpXMLProtocol})
 	}
 
-	// 如果用户没有提供 Antigravity 身份，添加结束标记
-	if !userHasAntigravityIdentity {
+	// 身份段之后的结束标记，只有注入身份时才需要
+	if opts.EnableIdentityPatch {
 		parts = append(parts, GeminiPart{Text: "\n--- [SYSTEM_PROMPT_END] ---"})
 	}
 
@@ -464,7 +432,19 @@ func buildContents(messages []ClaudeMessage, toolIDToName map[string]string, isT
 		}
 
 		if role == "system" {
-			systemParts = append(systemParts, parts...)
+			// system 角色的消息块同样要清洗：之前只处理顶层 system 字段，
+			// 漏掉了 messages[].role=="system" 里的触发句。
+			cleaned := make([]GeminiPart, 0, len(parts))
+			for _, part := range parts {
+				if part.Text != "" {
+					part.Text = NeutralizeSystemIdentity(part.Text)
+					if strings.TrimSpace(part.Text) == "" {
+						continue
+					}
+				}
+				cleaned = append(cleaned, part)
+			}
+			systemParts = append(systemParts, cleaned...)
 			continue
 		}
 

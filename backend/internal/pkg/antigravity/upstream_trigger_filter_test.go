@@ -57,12 +57,14 @@ func TestNeutralizeSystemIdentity_AlsoStripsTriggerSentence(t *testing.T) {
 	require.Contains(t, got, "You are an AI agent.")
 }
 
-func TestNeutralizeSystemIdentity_RewritesHermesOpener(t *testing.T) {
+func TestNeutralizeSystemIdentity_StripsHermesOpener(t *testing.T) {
 	got := NeutralizeSystemIdentity(hermesIdentityLine + " Help users with their tasks.")
 
 	require.NotContains(t, got, "Hermes")
 	require.NotContains(t, got, "Nous Research")
-	require.Equal(t, "You are an AI agent. Help users with their tasks.", got)
+	// Hermes 只由 trigger filter 处理（避免两套机制重写同一行），
+	// 删除触发句后剩余正文保留。
+	require.Equal(t, "Help users with their tasks.", got)
 }
 
 func TestNeutralizeSystemIdentity_RewritesPiOpener(t *testing.T) {

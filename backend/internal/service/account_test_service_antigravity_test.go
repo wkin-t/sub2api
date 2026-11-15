@@ -3,6 +3,7 @@
 package service
 
 import (
+	"context"
 	"encoding/json"
 	"testing"
 
@@ -20,7 +21,7 @@ func TestAntigravityBuildGeminiTestRequest_IncludesValidatedToolConfig(t *testin
 	t.Parallel()
 
 	svc := &AntigravityGatewayService{}
-	raw, err := svc.buildGeminiTestRequestWithPrompt("proj-123", "gemini-3.8-flash-high", "")
+	raw, err := svc.buildGeminiTestRequestWithPrompt(context.Background(), "proj-123", "gemini-3.8-flash-high", "")
 	require.NoError(t, err)
 
 	var v1Req map[string]any
@@ -41,7 +42,7 @@ func TestAntigravityBuildGeminiTestRequestWithPrompt_ImageModel(t *testing.T) {
 	t.Parallel()
 
 	svc := &AntigravityGatewayService{}
-	raw, err := svc.buildGeminiTestRequestWithPrompt("proj-123", "gemini-3.1-flash-image", "a cute cat")
+	raw, err := svc.buildGeminiTestRequestWithPrompt(context.Background(), "proj-123", "gemini-3.1-flash-image", "a cute cat")
 	require.NoError(t, err)
 
 	var v1Req map[string]any
@@ -90,7 +91,7 @@ func TestAntigravityBuildGeminiTestRequest_UsesPromptAndRoomToAnswer(t *testing.
 
 	svc := &AntigravityGatewayService{}
 	for _, tc := range []struct{ prompt, want string }{{"hello there", "hello there"}, {"", "hi"}, {"   ", "hi"}} {
-		raw, err := svc.buildGeminiTestRequestWithPrompt("proj-123", "gemini-4-argon-high", tc.prompt)
+		raw, err := svc.buildGeminiTestRequestWithPrompt(context.Background(), "proj-123", "gemini-4-argon-high", tc.prompt)
 		require.NoError(t, err)
 		var v1Req map[string]any
 		require.NoError(t, json.Unmarshal(raw, &v1Req))
@@ -107,12 +108,12 @@ func TestAntigravityBuildClaudeTestRequest_UsesPromptAndRoomToAnswer(t *testing.
 	t.Parallel()
 
 	svc := &AntigravityGatewayService{}
-	raw, err := svc.buildClaudeTestRequest("proj-123", "claude-sonnet-4-6", "hello there")
+	raw, err := svc.buildClaudeTestRequest(context.Background(), "proj-123", "claude-sonnet-4-6", "hello there")
 	require.NoError(t, err)
 	require.Contains(t, string(raw), "hello there")
 	require.NotContains(t, string(raw), `"text":"."`)
 
-	raw, err = svc.buildClaudeTestRequest("proj-123", "claude-sonnet-4-6", "")
+	raw, err = svc.buildClaudeTestRequest(context.Background(), "proj-123", "claude-sonnet-4-6", "")
 	require.NoError(t, err)
 	require.Contains(t, string(raw), `"hi"`)
 }
