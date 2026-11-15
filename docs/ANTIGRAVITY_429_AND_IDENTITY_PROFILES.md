@@ -64,6 +64,13 @@
 | `SUB2API_ANTIGRAVITY_IDENTITY_PROFILE` | `agy-cli` | `agy-cli` / `agy-cli-generic`（同前）/ `agy-cli-coding` / `legacy`（上游旧文本，等价 `upstream`） |
 | `SUB2API_ANTIGRAVITY_IDENTITY_PROMPT_FILE` | 空 | 从文件读取完整身份提示词（≤ 256 KB），优先级高于 profile；可指向抓包得到的完整静态提示词 |
 | `SUB2API_ANTIGRAVITY_USER_AGENT` | 空 | 完整 User-Agent 覆盖（≤ 512 字节、禁止换行）。用于对齐官方客户端 UA；注意 UA 影响模型门控/配额归属 |
+| `SUB2API_ANTIGRAVITY_SESSION_ID_MODE` | `official` | `official`（官方常量 `-3750763034362895579`）/ `content`（旧行为：首条用户文本 sha256）/ `random` |
+| `SUB2API_ANTIGRAVITY_UA_PROFILE` | `hub` | `hub`（官方 hub 格式）/ `agy-cli`（CLI 格式，`auth_method=consumer`）/ `legacy`（旧无元组格式） |
+| `SUB2API_ANTIGRAVITY_UA_CL` | 按版本映射 | Piper changelist；默认按版本映射（1.5.9→1021519450、2.23.0→998057262、2.28.0→1008300195） |
+| `SUB2API_ANTIGRAVITY_UA_VERSION` | `2.28.0` | 官方客户端版本（也可用 `ANTIGRAVITY_USER_AGENT_VERSION` 或后台 `antigravity_user_agent_version` 覆盖） |
+| `SUB2API_ANTIGRAVITY_UA_OS` / `_ARCH` | `windows` / `amd64` | UA 元组中的平台标识 |
+| `SUB2API_ANTIGRAVITY_HTTP2` | `1` | Antigravity 推理是否使用 HTTP/2（与官方 Go 客户端一致）；`0` 回退 HTTP/1.1 |
+| `SUB2API_ANTIGRAVITY_MODEL_ENUM_MAP` | 空 | 追加 `labels.model_enum` 映射（JSON：`{"模型":"MODEL_PLACEHOLDER_Mxxx"}`） |
 | 后台设置 `enable_identity_patch` | `true` | 是否注入身份补丁（Antigravity 转发路径强制开启） |
 | 后台设置 `identity_patch_prompt` | 空 | 非空时覆盖 profile，作为身份提示词正文 |
 
@@ -104,17 +111,85 @@ ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now();
 注意：不要用 `PUT /api/v1/admin/settings` 只提交部分字段——该接口的多数字段是非指针类型，
 缺省字段会被写成零值（例如 `enable_identity_patch` 会被关掉）。如走 API，请先 GET 完整配置再改后整体 PUT。
 
-## 4. 新增/修改的代码位置
+## 4. Wire 身份对齐（sessionId / requestId / labels）
+
+真实客户端的请求不是「一个 sessionId + systemInstruction」那么简单。对照真机抓包
+（Antigravity-Manager `docs/JEIKL_ANTIGRAVITY_CLIENT_CAPTURE.md`：三份 Windows 原生客户端报文）
+与 agy CLI 本机实测（`AGY_LLM_GATEWAY_URL` 指向本地明文服务，零计费抓到完整请求）：
+
+- **sessionId 是常量**：三份样本与 277 个本地会话库、125,533 处取值全部是
+  `-3750763034362895579` = `int64(FNV-1a 64(""))` = `int64(0xcbf29ce484222325)`。
+  外部说法「空字符串 hash」成立，但不是 sha256；sub2api 原来的「首条用户消息 sha256」是错的。
+- **requestId**：`agent/<agentId>/<step>`（step 为该 trajectory 的步数；真机样本 21/13/22）。
+- **labels**（`request.labels`，真机三份都带，sub2api 原来完全没有）：
+  `last_step_index`、`model_enum`（如 `MODEL_PLACEHOLDER_M298` / `M35`）、
+  `request_id = <trajectory_id>-<n>`、`trajectory_id`、`used_claude`、
+  `used_claude_conservative`、`used_non_gemini_model`；历史轮次还带 `last_execution_id`。
+- **会话绑定**：`trajectory_id` 是独立 UUID；CLI 侧实测 `conversation_id == cascade_id == root_cascade_id`，
+  `request_id = <trajectory_id>-<genIdx>`，另有 `client="antigravity-cli"` label
+  （见 `recon/agy-wire-fingerprint.md`）。
+- 真机 `request` 内部键序：`contents, systemInstruction, tools, labels, generationConfig, sessionId`
+  （Claude 转换链路由结构体字段顺序保证；Gemini 原生链路经 map 重排，暂未完全对齐）。
+- 真机样本**没有 `toolConfig`**，sub2api 恒发 `mode=VALIDATED`（上游历史验证为「不带会 400」），
+  这里保留现状，属于已知差异。
+
+本分支实现（`backend/internal/pkg/antigravity/envelope.go` + `service/antigravity_wire_identity.go`）：
+
+- sessionId 默认官方常量；`SUB2API_ANTIGRAVITY_SESSION_ID_MODE=content/random` 可回退/实验。
+- agent/trajectory UUID 由 `(客户端 session id 或首条用户文本) + 服务账号` 派生：
+  同一会话稳定，账号切换时重新起 cascade（避免同一 cascade 出现在多个账号上、把号池关联成一个客户端）。
+- `step` / `request_id` 的计数由 contents 长度近似（无状态网关无法复现客户端侧真实计数器）；
+  `last_execution_id` 暂缺（需要跨请求状态存储）。
+- labels 中 `model_enum` 只对已抓包确认的模型映射（`gemini-3.7-flash-high`→`M298`、
+  `claude-sonnet-4-6`→`M35`），其余留空（上游接受缺省）；可用 env 追加。
+
+## 5. UA 与 cl
+
+官方 UA 实测（`recon/agy-wire-fingerprint.md`）：
+
+- CLI：`antigravity/cli/1.5.9 (aidev_client; os_type=windows; arch=amd64; cl=1021519450; auth_method=consumer)`
+- Hub：`antigravity/hub/2.23.0 (aidev_client; os_type=darwin; arch=arm64; cl=998057262)`、
+  `antigravity/hub/2.28.0 (…; cl=1008300195)`（Antigravity-Manager 校准值）
+
+sub2api 原来发的是旧格式 `antigravity/hub/2.23.0 windows/amd64`（没有 `aidev_client` 元组和 `cl`）。
+本分支默认改为 **hub 2.28.0 + cl=1008300195**，版本与 cl 按映射表配对（避免版本改了 cl 没改）；
+`SUB2API_ANTIGRAVITY_UA_PROFILE=agy-cli` 可切成 CLI 格式（`auth_method=consumer`）。
+**注意**：上游按 UA 家族 + 版本做模型门控（sub2api #8062：裸 UA 26 个模型、hub/2.23.0 29 个模型），
+改版本会改变可用模型集合，升级前先确认。
+
+## 6. HTTP/2 与 TLS 指纹
+
+- 官方 agy 的 `ClientHello` 是**纯 Go stdlib 默认指纹**（无 GREASE、ALPN `h2+http/1.1`、TLS 1.3）：
+  JA3 `03117a8ed39ef02427ebbc39f121275c`、JA4 `t13d1311hh_f57a46bbacb6_f43d0ea13f66`
+  （本机 agy 1.5.9 抓取；agy 用 `go1.28-20261102-RC00` 构建）。
+- sub2api 的 Antigravity 推理请求原来走 **HTTP/1.1**：`buildUpstreamTransport` 设置了自定义
+  `DialContext`，Go 不会自动启用 HTTP/2，因此 ALPN 只报 `http/1.1`，与官方（h2）不一致。
+  本分支默认对 Antigravity 请求启用 HTTP/2（复用 `HTTPUpstreamProfileLongStream` 传输，
+  带 h2 PING keepalive），可用 `SUB2API_ANTIGRAVITY_HTTP2=0` 回退。
+- **不要**给 Antigravity 套现有的 utls 指纹模板：内置默认 profile 是 Node.js 24.x（Claude Code）
+  的 JA3/JA4，套在 Go 客户端上反而更不像官方；而且 utls 传输固定 HTTP/1.1，会和 h2 的 ALPN 冲突。
+  当前 Antigravity 链路没有接入 `DoWithTLS`（账号 `enable_tls_fingerprint` 也只对 Anthropic 生效）。
+- 若未来要做到 JA3/JA4 字节级一致：需要把构建工具链对齐到 Go 1.28（agy 的构建版本），
+  或用 utls 定制 ClientHello 并同时实现 h2。**优先级低于 wire 字段与 UA/cl**。
+
+
+
+## 7. 新增/修改的代码位置
 
 - `backend/internal/pkg/antigravity/upstream_trigger_filter.go` — 触发句清洗（默认模式 + env 扩展）
-- `backend/internal/pkg/antigravity/request_transformer.go` — `NeutralizeSystemIdentity` 接入清洗；opener 增加 Pi / Hermes
+- `backend/internal/pkg/antigravity/request_transformer.go` — `NeutralizeSystemIdentity` 接入清洗；opener 增加 Pi / Hermes；生成 wire 身份（sessionId/labels/requestId）
 - `backend/internal/pkg/antigravity/identity_profiles.go` + `prompts/` — 身份 profile（`go:embed` 两个官方身份变体）
-- `backend/internal/pkg/antigravity/oauth.go` — 完整 UA 覆盖
-- `backend/internal/service/antigravity_gateway_service.go` — `injectIdentityPatchToGeminiRequest` 支持自定义提示词、清洗后空 part 物理移除
-- `backend/internal/service/antigravity_gateway_gemini.go` / `antigravity_gateway_compat.go` — 两条 Gemini 链路使用后台配置的提示词
+- `backend/internal/pkg/antigravity/envelope.go` — wire 身份：官方 sessionId 常量、agent/trajectory UUID 派生、labels、requestId、model_enum
+- `backend/internal/pkg/antigravity/oauth.go` — 官方 UA 家族（hub/agy-cli/legacy）+ 版本/CL/平台元组
+- `backend/internal/pkg/antigravity/gemini_types.go` — 请求结构体字段顺序 + `labels` 字段
+- `backend/internal/service/antigravity_wire_identity.go` — 会话种子/账号作用域、HTTP/2 传输标记
+- `backend/internal/service/antigravity_gateway_service.go` — `wrapV1InternalRequestWithContext` 补全 Gemini 链路 wire 身份；`injectIdentityPatchToGeminiRequest` 支持自定义提示词、清洗后空 part 物理移除
+- `backend/internal/service/antigravity_gateway_gemini.go` / `antigravity_gateway_compat.go` — 两条 Gemini 链路使用后台配置的提示词 + wire 身份
 - `backend/internal/service/antigravity_gateway_claude.go` — 签名重试路径也强制注入身份（与主路径一致）
+- `backend/internal/service/antigravity_gateway_retry.go` / `antigravity_credits_overages.go` — 推理请求携带 HTTP/2 传输标记
+- `backend/internal/repository/http_upstream.go` — TLS 指纹 client 缓存键并入 profile 指纹（改绑 profile 立即生效、避免跨账号串用）
 
-## 5. 验证与后续
+## 8. 验证与后续
 
 受控实验（照抄社区已跑通范式）：
 
@@ -133,21 +208,37 @@ go test -tags=unit -run 'Antigravity|IdentityPatch|Attribution' ./internal/servi
 go build ./...
 ```
 
+wire 身份可用本地网关对照验证：把 agy 指向本地明文服务（`AGY_LLM_GATEWAY_URL=http://127.0.0.1:<port>`，
+零计费）抓一份真实请求，再与 sub2api 出站 body 逐字段 diff；
+抓包与复现脚本见工作区 `recon/agy-wire-fingerprint.md` 与 `recon/agy-prompt/_evidence/wire-capture/`。
+
+已知未对齐（按影响排序）：
+
+- `toolConfig`：真机样本没有，sub2api 恒发 `mode=VALIDATED`（上游历史验证为必需，保留）。
+- `last_execution_id`：真机历史轮次带上一轮 response id，sub2api 无跨请求状态，暂缺。
+- `labels.last_step_index / request_id` 计数：由 contents 长度近似，非客户端真实计数器。
+- systemInstruction 里没有 `<user_information>` 的 `Conversation ID`（真机会话身份的一部分）；
+  身份 profile 目前只替换 identity 段。
+- Gemini 原生链路的 `request` 内部键序经 map 重排，与真机顺序不同。
+- TLS/HTTP2：官方是 Go 1.28 默认指纹；sub2api 构建用 Go 1.26.2，即使同为 Go，ClientHello
+  也可能因版本差异略有不同；utls 定制 + h2 一致是后续工作。
+
 后续可选项（未实现）：
 
 - 上游 PR #8836：裸 429 只冷却失败模型，避免整池 503 级联；上游合并后可直接 rebase。
 - 把 strip 列表迁移到后台设置（需要迁移 + 前端输入框），便于不重启调整。
 - 删除自造的 model identity / silent-boundary / `[SYSTEM_PROMPT_END]` 段（官方客户端没有这些文本，
   目前无证据表明会触发 429，但属于可识别指纹）。
+- 给 Antigravity 增加 `DoWithTLS` 接入（需要先用 Go 1.28 构建/utls 抓取官方 ClientHello 并支持 h2，否则默认 Node profile 反而更不像）。
 
-## 6. 风险提示
+## 9. 风险提示
 
 - 消费端 OAuth 令牌调用 `cloudcode-pa` 私有端点本身违反 Google 服务条款，已有封号公开报告；
   本分支只解决「内容误触发」的工程问题，不改变这一事实。
 - 黑名单是滚动更新的；新增触发句时通过 `SUB2API_ANTIGRAVITY_STRIP_PATTERNS` 热配置，无需改代码。
 - 任何指纹伪装都是军备竞赛，不能承诺长期有效。
 
-## 7. 参考链接
+## 10. 参考链接
 
 - sub2api #8824 / PR #8829（Dual-use 句 + 可配置 strip 方向）：<https://github.com/Wei-Shaw/sub2api/issues/8824>
 - sub2api #8791 / PR #8793（Pi 身份句）：<https://github.com/Wei-Shaw/sub2api/issues/8791>
