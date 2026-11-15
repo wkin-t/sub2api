@@ -70,6 +70,8 @@
 | `ANTIGRAVITY_USER_AGENT_VERSION` | `2.23.0` | 官方客户端版本（也可用后台 `antigravity_user_agent_version` 覆盖）。默认保持上游验证过的 2.23.0；显式设 `2.28.0` 可对齐最新 hub，但会改变上游模型门控 |
 | `SUB2API_ANTIGRAVITY_UA_OS` / `_ARCH` | `windows` / `amd64` | UA 元组中的平台标识；抓包样本是 darwin/arm64，部署默认 windows/amd64，可 env 覆盖 |
 | `SUB2API_ANTIGRAVITY_HTTP2` | `1` | Antigravity 推理是否使用 HTTP/2（与官方 Go 客户端一致，属有意的默认行为变更）；`0` 回退 HTTP/1.1 |
+| `SUB2API_ANTIGRAVITY_429_DIAG` | 空（关闭） | 伪 429 观测：`summary` 只记分类/指纹；`dump` 额外把 systemInstruction 落到 0600 文件。env 启动时读取，改完需重启 |
+| `SUB2API_ANTIGRAVITY_429_DIAG_DIR` | `$TMPDIR/sub2api-429-diag` | dump 目录（目录 0700、文件 0600；建议挂到持久卷，排障后删除） |
 | `SUB2API_ANTIGRAVITY_MODEL_ENUM_MAP` | 空 | 追加 `labels.model_enum` 映射（JSON：`{"模型":"MODEL_PLACEHOLDER_Mxxx"}`） |
 | 后台设置 `enable_identity_patch` | `true` | 是否注入身份补丁（Antigravity 转发路径强制开启） |
 | 后台设置 `identity_patch_prompt` | 空 | 非空时覆盖 profile，作为身份提示词正文 |
@@ -268,7 +270,71 @@ wire 身份可用本地网关对照验证：把 agy 指向本地明文服务（`
   但 env 在进程启动时读取一次，**改完需要重启**（不是热配置）。
 - 任何指纹伪装都是军备竞赛，不能承诺长期有效。
 
-## 10. 参考链接
+## 11. 上线观测 429（runbook）
+
+目标：先用线上数据回答「伪 429 还有没有、触发点是否仍在 systemInstruction」，再决定要不要继续提升
+wire 真实性。**这一步不需要抓包。**
+
+### 11.1 部署本分支（二选一）
+
+Docker Compose（在仓库根目录构建，构建上下文必须是根目录）：
+
+```bash
+git clone -b feat/antigravity-agy-prompt https://github.com/wkin-t/sub2api.git sub2api-agy
+cd sub2api-agy
+docker build -f deploy/Dockerfile -t sub2api:agy-429-watch .
+# 在现有 compose 目录新增 docker-compose.override.yml：
+# services:
+#   sub2api:
+#     image: sub2api:agy-429-watch
+#     environment:
+#       - SUB2API_ANTIGRAVITY_429_DIAG=summary
+docker compose -f deploy/docker-compose.yml up -d
+```
+
+systemd / 二进制安装：`make -C backend build-embed`，按现有方式替换二进制（`install.sh` 布局是
+`/opt/sub2api` + `/etc/sub2api/config.yaml`），在 service 的 `Environment=` 或 env 文件里加变量后重启。
+
+### 11.2 两阶段开启
+
+1. 先 `SUB2API_ANTIGRAVITY_429_DIAG=summary` 跑 24–48h（只记哈希/分类，无敏感内容）；
+2. 若仍有伪 429，再短窗口切 `dump`（建议 ≤1h）并挂载 `/app/data/429-diag`，拿到指纹重复的失败
+   systemInstruction 后立刻切回 `summary` 或关闭，并删除 dump 文件。
+
+日志行格式（每次上游 429 一条）：
+
+```
+status=429 diag=1 account=12 model=gemini-3.7-flash-high base_url=... category=unknown pseudo=true
+retryinfo=false quota_delay=false system_sha=ab12cd34ef56a789 system_len=20007 body=...
+```
+
+### 11.3 统计与判读
+
+```bash
+docker logs sub2api --since 48h 2>&1 | grep "status=429" > /tmp/429.log
+grep -c "status=429" /tmp/429.log                 # 429 总数
+grep -c "pseudo=true" /tmp/429.log                # 伪 429 数
+grep -c "pseudo=false" /tmp/429.log               # 真限流数
+grep "pseudo=true" /tmp/429.log | grep -o "system_sha=[0-9a-f]*" | sort | uniq -c | sort -rn | head
+grep "pseudo=true" /tmp/429.log | grep -o "model=[^ ]*" | sort | uniq -c
+```
+
+- **pseudo=true 且 system_sha 高度重复** → 同一 systemInstruction 触发；用 dump 文件与同客户端/同模型的
+  成功请求 diff，找出反复出现的句子，作为新正则加进 `SUB2API_ANTIGRAVITY_STRIP_PATTERNS`（每行一条 Go
+  regexp），重启后观察该 sha 是否消失。
+- **pseudo=true 且 sha 全不重复** → 触发点可能不在 systemInstruction（用户内容/tools/generationConfig），
+  或黑名单按语义而非固定句子；不要在 strip 列表里堆正则，改为对同一请求做「只改 systemInstruction」的 A/B。
+- **pseudo=false** → 真限流（带 RetryInfo/quotaResetDelay），检查配额/并发/账号池，与本分支无关。
+
+### 11.4 安全与回滚
+
+- dump 文件含客户端 systemInstruction（可能包含用户规则/密钥引用），权限 0600、目录 0700；
+  不要提交仓库、不要上传第三方，排障完删除。`summary` 模式只有哈希，可长期开。
+- 回滚：把 `..._429_DIAG` 置空并重启即可；功能代码与诊断代码互不影响。
+- 判定成功：24–48h 内伪 429 不再出现新的重复 sha，且 pseudo 数趋势下降；否则把 `/tmp/429.log` 与 1–2 个
+  dump 文件（脱敏后）带回分析。
+
+## 12. 参考链接
 
 - sub2api #8824 / PR #8829（Dual-use 句 + 可配置 strip 方向）：<https://github.com/Wei-Shaw/sub2api/issues/8824>
 - sub2api #8791 / PR #8793（Pi 身份句）：<https://github.com/Wei-Shaw/sub2api/issues/8791>
