@@ -187,10 +187,14 @@ sub2api 原来发的是旧格式 `antigravity/hub/2.23.0 windows/amd64`（没有
 - **不要**给 Antigravity 套现有的 utls 指纹模板：内置默认 profile 是 Node.js 24.x（Claude Code）
   的 JA3/JA4，套在 Go 客户端上反而更不像官方；而且 utls 传输固定 HTTP/1.1，会和 h2 的 ALPN 冲突。
   当前 Antigravity 链路没有接入 `DoWithTLS`（账号 `enable_tls_fingerprint` 也只对 Anthropic 生效）。
-- 若未来要做到 JA3/JA4 字节级一致：agy 用 `go1.28-20261102-RC00` 构建，而本仓库 `backend/go.mod`
-  要求 **Go 1.27.3**（CI 断言 1.27.x；`go version` 显示的本地工具链版本可能不同，因为 Go 会按 go.mod
-  自动切换 toolchain）。需要把构建工具链对齐到 Go 1.28，或用 utls 定制 ClientHello 并同时实现 h2。
-  **优先级低于 wire 字段与 UA/cl**。
+- **实测结论（2026-11-16）**：用本仓库 go.mod 的 Go 1.27.3 默认 TLS 配置（带 SNI +
+  ALPN `h2,http/1.1`）抓 ClientHello，JA3 `03117a8ed39ef02427ebbc39f121275c`、
+  JA4 `t13d1311hh_f57a46bbacb6_f43d0ea13f66` 与 agy 1.5.9（go1.28）**逐字节一致**。
+  因此 TLS 层不需要 utls、也不需要对齐 Go 1.28；只要 Antigravity 链路保持默认 Go TLS + h2
+  （`SUB2API_ANTIGRAVITY_HTTP2=1`，默认即开）即可。若关掉 HTTP/2 回到 h1，ALPN 会变成
+  `http/1.1`，JA4 末尾从 `hh` 变 `h1`，那才是不一致。
+  残余未比对：HTTP/2 SETTINGS 帧参数（Go 1.27.3 vs 1.28），影响远小于 JA3/JA4。
+  复现脚本与原始字节见工作区 `recon/_work/tlscheck/`（`check2.py`/`check3.py`）。
 
 
 
