@@ -552,7 +552,7 @@ func (s *GeminiMessagesCompatService) Forward(ctx context.Context, c *gin.Contex
 		mappedModel = account.GetMappedModel(req.Model)
 	}
 
-	geminiReq, err := convertClaudeMessagesToGeminiGenerateContent(body, mappedModel)
+	geminiReq, err := convertClaudeMessagesToGeminiGenerateContent(body, mappedModel, true)
 	if err != nil {
 		return nil, s.writeClaudeError(c, http.StatusBadRequest, "invalid_request_error", err.Error())
 	}
@@ -692,7 +692,7 @@ func (s *GeminiMessagesCompatService) Forward(ctx context.Context, c *gin.Contex
 			if req.Stream {
 				action = "streamGenerateContent"
 			}
-			fullURL, err := buildVertexGeminiAccountURL(account, mappedModel, action, req.Stream)
+			fullURL, err := buildVertexGeminiAccountURL(account, mappedModel, action, req.Stream, "")
 			if err != nil {
 				return nil, "", err
 			}
@@ -796,7 +796,7 @@ func (s *GeminiMessagesCompatService) Forward(ctx context.Context, c *gin.Contex
 					stageName = "thinking+tools"
 					signatureRetryStage = 2
 				}
-				retryGeminiReq, txErr := convertClaudeMessagesToGeminiGenerateContent(strippedClaudeBody, mappedModel)
+				retryGeminiReq, txErr := convertClaudeMessagesToGeminiGenerateContent(strippedClaudeBody, mappedModel, true)
 				if txErr == nil {
 					logger.LegacyPrintf("service.gemini_messages_compat", "Gemini account %d: detected signature-related 400, retrying with downgraded Claude blocks (%s)", account.ID, stageName)
 					// 降级只改写历史块，思考参数沿用客户端原始请求。
@@ -1081,6 +1081,7 @@ func (s *GeminiMessagesCompatService) Forward(ctx context.Context, c *gin.Contex
 		ImageCount:                    imageCount,
 		ImageSize:                     imageSize,
 		ImageInputSize:                imageInputSize,
+		UpstreamPriceMultiplier:       VertexUpstreamPriceMultiplier(account, mappedModel, ""),
 	}, nil
 }
 
@@ -1147,6 +1148,8 @@ func (s *GeminiMessagesCompatService) ForwardNative(ctx context.Context, c *gin.
 
 	var requestIDHeader string
 	var buildReq func(ctx context.Context) (*http.Request, string, error)
+	// cachedContentLocation 是 Vertex 账号请求引用的显式缓存所在区域，未引用时为空。
+	var cachedContentLocation string
 
 	switch account.Type {
 	case AccountTypeAPIKey:
@@ -1247,8 +1250,9 @@ func (s *GeminiMessagesCompatService) ForwardNative(ctx context.Context, c *gin.
 		requestIDHeader = "x-request-id"
 
 	case AccountTypeServiceAccount:
+		cachedContentLocation = geminiCachedContentLocationInBody(body)
 		buildReq = func(ctx context.Context) (*http.Request, string, error) {
-			fullURL, err := buildVertexGeminiAccountURL(account, mappedModel, upstreamAction, useUpstreamStream)
+			fullURL, err := buildVertexGeminiAccountURL(account, mappedModel, upstreamAction, useUpstreamStream, cachedContentLocation)
 			if err != nil {
 				return nil, "", err
 			}
@@ -1618,6 +1622,7 @@ func (s *GeminiMessagesCompatService) ForwardNative(ctx context.Context, c *gin.
 		ImageCount:                    imageCount,
 		ImageSize:                     imageSize,
 		ImageInputSize:                imageInputSize,
+		UpstreamPriceMultiplier:       VertexUpstreamPriceMultiplier(account, mappedModel, cachedContentLocation),
 	}, nil
 }
 
@@ -2215,6 +2220,7 @@ func (s *GeminiMessagesCompatService) handleStreamingResponse(c *gin.Context, re
 	openToolIndex := -1
 	openToolID := ""
 	openToolName := ""
+	var toolBoundary geminiToolCallBoundary
 	var seenToolJSON geminiTextDelta
 
 	reader := newBoundedSSELineReader(resp.Body, s.cfg)
@@ -2282,6 +2288,7 @@ func (s *GeminiMessagesCompatService) handleStreamingResponse(c *gin.Context, re
 					openToolIndex = -1
 					openToolName = ""
 					seenToolJSON.reset()
+					toolBoundary = geminiToolCallBoundary{}
 				}
 				if openBlockType != "thinking" {
 					if openBlockIndex >= 0 {
@@ -2333,6 +2340,7 @@ func (s *GeminiMessagesCompatService) handleStreamingResponse(c *gin.Context, re
 					openToolIndex = -1
 					openToolName = ""
 					seenToolJSON.reset()
+					toolBoundary = geminiToolCallBoundary{}
 				}
 
 				delta := seenText.next(text)
@@ -2378,7 +2386,6 @@ func (s *GeminiMessagesCompatService) handleStreamingResponse(c *gin.Context, re
 
 			if fc, ok := part["functionCall"].(map[string]any); ok && fc != nil {
 				name, _ := fc["name"].(string)
-				args := fc["args"]
 				if strings.TrimSpace(name) == "" {
 					name = "tool"
 				}
@@ -2394,7 +2401,8 @@ func (s *GeminiMessagesCompatService) handleStreamingResponse(c *gin.Context, re
 				}
 
 				// If we receive streamed tool args in pieces, keep a single tool block open and emit deltas.
-				if openToolIndex >= 0 && openToolName != name {
+				argsJSONText := geminiToolCallArgsJSON(fc["args"])
+				if openToolIndex >= 0 && toolBoundary.startsNewBlock(openToolName, seenToolJSON.seen.String(), argsJSONText, fc) {
 					writeSSE(c.Writer, "content_block_stop", map[string]any{
 						"type":  "content_block_stop",
 						"index": openToolIndex,
@@ -2402,6 +2410,7 @@ func (s *GeminiMessagesCompatService) handleStreamingResponse(c *gin.Context, re
 					openToolIndex = -1
 					openToolName = ""
 					seenToolJSON.reset()
+					toolBoundary = geminiToolCallBoundary{}
 				}
 
 				if openToolIndex < 0 {
@@ -2423,21 +2432,8 @@ func (s *GeminiMessagesCompatService) handleStreamingResponse(c *gin.Context, re
 					})
 				}
 
-				argsJSONText := "{}"
-				switch v := args.(type) {
-				case nil:
-					// keep default "{}"
-				case string:
-					if strings.TrimSpace(v) != "" {
-						argsJSONText = v
-					}
-				default:
-					if b, err := json.Marshal(args); err == nil && len(b) > 0 {
-						argsJSONText = string(b)
-					}
-				}
-
 				delta := seenToolJSON.next(argsJSONText)
+				toolBoundary.observe(fc)
 				if delta != "" {
 					writeSSE(c.Writer, "content_block_delta", map[string]any{
 						"type":  "content_block_delta",
@@ -3470,7 +3466,7 @@ func mapGeminiFinishReasonToClaudeStopReason(finishReason string) string {
 	}
 }
 
-func convertClaudeMessagesToGeminiGenerateContent(body []byte, model string) ([]byte, error) {
+func convertClaudeMessagesToGeminiGenerateContent(body []byte, model string, splitToolResultTurns bool) ([]byte, error) {
 	var req map[string]any
 	if err := json.Unmarshal(body, &req); err != nil {
 		return nil, err
@@ -3479,7 +3475,7 @@ func convertClaudeMessagesToGeminiGenerateContent(body []byte, model string) ([]
 	toolUseIDToName := make(map[string]string)
 
 	systemText := extractClaudeSystemText(req["system"])
-	contents, err := convertClaudeMessagesToGeminiContents(req["messages"], toolUseIDToName, gemini.SupportsMultimodalFunctionResponses(model))
+	contents, err := convertClaudeMessagesToGeminiContents(req["messages"], toolUseIDToName, gemini.SupportsMultimodalFunctionResponses(model), splitToolResultTurns)
 	if err != nil {
 		return nil, err
 	}
@@ -3559,7 +3555,7 @@ func extractClaudeSystemText(system any) string {
 	}
 }
 
-func convertClaudeMessagesToGeminiContents(messages any, toolUseIDToName map[string]string, multimodalToolResults bool) ([]any, error) {
+func convertClaudeMessagesToGeminiContents(messages any, toolUseIDToName map[string]string, multimodalToolResults, splitToolResultTurns bool) ([]any, error) {
 	arr, ok := messages.([]any)
 	if !ok {
 		return nil, errors.New("messages must be an array")
@@ -3680,8 +3676,8 @@ func convertClaudeMessagesToGeminiContents(messages any, toolUseIDToName map[str
 		}
 
 		// Anthropic 会合并相邻 user 消息，但 Vertex 拒绝工具响应与后续文本共用
-		// 一个 Content。保留连续工具响应组，避免拆散并行调用的结果。
-		if gRole == "user" && len(parts) > 1 {
+		// 一个 Content。Antigravity 旧模型仍要求工具图片紧随结果，不能套用此限制。
+		if splitToolResultTurns && gRole == "user" && len(parts) > 1 {
 			start := 0
 			for i := 1; i <= len(parts); i++ {
 				if i < len(parts) {

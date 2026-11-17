@@ -379,7 +379,7 @@ func TestConvertClaudeMessagesToGeminiContents_PreservesParallelResultsAndMedia(
 					{"type":"text","text":"Explain both results."}
 				]}
 			]`), &messages))
-			got, err := convertClaudeMessagesToGeminiContents(messages, make(map[string]string), multimodal)
+			got, err := convertClaudeMessagesToGeminiContents(messages, make(map[string]string), multimodal, true)
 			require.NoError(t, err)
 			require.Len(t, got, 3)
 			model, ok := got[0].(map[string]any)
@@ -432,7 +432,7 @@ func TestConvertClaudeMessagesToGeminiContents_DoesNotInventUserTurns(t *testing
 		map[string]any{"role": "user", "content": "Question"},
 		map[string]any{"role": "assistant", "content": "Partial answer"},
 	}
-	got, err := convertClaudeMessagesToGeminiContents(messages, make(map[string]string), true)
+	got, err := convertClaudeMessagesToGeminiContents(messages, make(map[string]string), true, true)
 	require.NoError(t, err)
 	require.Equal(t, []any{
 		map[string]any{"role": "user", "parts": []any{map[string]any{"text": "Question"}}},
@@ -1039,7 +1039,7 @@ func TestConvertClaudeMessagesToGeminiGenerateContent_AddsThoughtSignatureForToo
 	}
 	b, _ := json.Marshal(claudeReq)
 
-	out, err := convertClaudeMessagesToGeminiGenerateContent(b, "gemini-2.5-flash")
+	out, err := convertClaudeMessagesToGeminiGenerateContent(b, "gemini-2.5-flash", true)
 	if err != nil {
 		t.Fatalf("convert failed: %v", err)
 	}
@@ -1107,7 +1107,7 @@ func TestConvertClaudeMessagesToGeminiGenerateContent_ExtractsToolResultImages(t
 	body, err := json.Marshal(claudeReq)
 	require.NoError(t, err)
 
-	converted, err := convertClaudeMessagesToGeminiGenerateContent(body, "gemini-2.5-flash")
+	converted, err := convertClaudeMessagesToGeminiGenerateContent(body, "gemini-2.5-flash", true)
 	require.NoError(t, err)
 
 	var geminiReq map[string]any

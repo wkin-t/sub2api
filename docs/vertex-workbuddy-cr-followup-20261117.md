@@ -29,3 +29,11 @@ CR 使用仓库 CI 对应的 golangci-lint 2.14.0，按 v0.2.20 过滤新增问�
 - 解除条件：在明确的框架集成或规则调整后复审；迁移时必须继续保留合法的 `properties["propertyNames"]` 参数名以及 required/default 普通数据。
 
 上述两项是架构规范与现有实现路径的差异，当前 CR 未证实它们对应新增的运行时功能故障。记录未完成项不会自动豁免后续新增协议转换行为。
+
+## v0.2.22 合并时的兼容验证
+
+上游新增的 Antigravity 旧模型工具图片回归发现，共享转换器不能对所有入口统一拆分工具响应 Content。修复通过显式 `splitToolResultTurns` 参数选择行为：Gemini/Vertex 正常及签名降级重试路径启用拆分，Antigravity 保持原消息格式。上游回归及原 Vertex 回归的输入、期望均保留。
+
+完整单测还在 Windows 上复现了上游原有 `TestOllamaProbeCallback_StaleLongDoesNotOverrideNewShort` 的时间构造问题：相邻 `time.Now()` 可能产生相同的冷却到期值，未真正构造出新 CAS 版本。未加本 fork 补丁的 v0.2.22 也失败。测试改为从既有到期值显式增加一秒，保留全部拒绝过期回调的断言；未改 Ollama 生产逻辑。
+
+同类时钟精度问题也会使 `TestCommandCodeGatewayPassesThroughCatalogProtocols` 的多个场景复用缓存键。测试 URL 增加场景序号，保留原协议和负载断言；未改协议目录生产逻辑。两条测试分别重复10次通过；最终完整单测61个包、13,092个顶层测试（含子测试28,222项）通过，前端关键及变更集合38文件782项通过。
