@@ -29,10 +29,14 @@ func TestGeminiChatCompletionsSeparatesToolResultsFromFollowingUserText(t *testi
 	require.NoError(t, err)
 	var got map[string]any
 	require.NoError(t, json.Unmarshal(geminiBody, &got))
-	contents := got["contents"].([]any)
+	contents, ok := got["contents"].([]any)
+	require.True(t, ok)
 	require.Len(t, contents, 4)
-	require.Equal(t, "model", contents[1].(map[string]any)["role"])
-	resultTurn := contents[2].(map[string]any)
+	modelTurn, ok := contents[1].(map[string]any)
+	require.True(t, ok)
+	require.Equal(t, "model", modelTurn["role"])
+	resultTurn, ok := contents[2].(map[string]any)
+	require.True(t, ok)
 	require.Equal(t, "user", resultTurn["role"])
 	require.Equal(t, []any{map[string]any{"functionResponse": map[string]any{
 		"name": "get_weather", "response": map[string]any{"content": "sunny, 20 C"},

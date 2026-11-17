@@ -3684,8 +3684,13 @@ func convertClaudeMessagesToGeminiContents(messages any, toolUseIDToName map[str
 			start := 0
 			for i := 1; i <= len(parts); i++ {
 				if i < len(parts) {
-					_, previousIsResponse := parts[i-1].(map[string]any)["functionResponse"]
-					_, nextIsResponse := parts[i].(map[string]any)["functionResponse"]
+					previousPart, previousOK := parts[i-1].(map[string]any)
+					nextPart, nextOK := parts[i].(map[string]any)
+					if !previousOK || !nextOK {
+						return nil, errors.New("invalid generated Gemini user content part")
+					}
+					_, previousIsResponse := previousPart["functionResponse"]
+					_, nextIsResponse := nextPart["functionResponse"]
 					if previousIsResponse == nextIsResponse {
 						continue
 					}
