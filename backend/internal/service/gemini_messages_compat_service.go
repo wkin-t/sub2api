@@ -3679,6 +3679,29 @@ func convertClaudeMessagesToGeminiContents(messages any, toolUseIDToName map[str
 			continue
 		}
 
+		// Anthropic 会合并相邻 user 消息，但 Vertex 拒绝工具响应与后续文本共用
+		// 一个 Content。保留连续工具响应组，避免拆散并行调用的结果。
+		if gRole == "user" && len(parts) > 1 {
+			start := 0
+			for i := 1; i <= len(parts); i++ {
+				if i < len(parts) {
+					previousPart, previousOK := parts[i-1].(map[string]any)
+					nextPart, nextOK := parts[i].(map[string]any)
+					if !previousOK || !nextOK {
+						return nil, errors.New("invalid generated Gemini user content part")
+					}
+					_, previousIsResponse := previousPart["functionResponse"]
+					_, nextIsResponse := nextPart["functionResponse"]
+					if previousIsResponse == nextIsResponse {
+						continue
+					}
+				}
+				out = append(out, map[string]any{"role": gRole, "parts": parts[start:i]})
+				start = i
+			}
+			continue
+		}
+
 		out = append(out, map[string]any{
 			"role":  gRole,
 			"parts": parts,
@@ -3897,7 +3920,7 @@ func cleanToolSchemaNode(schema any, schemaNode bool) any {
 			// 跳过不支持的字段
 			if key == "$schema" || key == "$id" || key == "$ref" ||
 				key == "$defs" || key == "definitions" ||
-				key == "additionalProperties" || key == "patternProperties" || key == "minLength" ||
+				key == "additionalProperties" || key == "patternProperties" || key == "propertyNames" || key == "minLength" ||
 				key == "maxLength" || key == "minItems" || key == "maxItems" || key == "exclusiveMinimum" ||
 				key == "deprecated" || key == "examples" {
 				continue
@@ -3914,7 +3937,7 @@ func cleanToolSchemaNode(schema any, schemaNode bool) any {
 				} else {
 					cleaned[key] = cleanToolSchemaNode(value, false)
 				}
-			case "items", "contains", "propertyNames", "if", "then", "else", "not", "contentSchema",
+			case "items", "contains", "if", "then", "else", "not", "contentSchema",
 				"additionalItems", "unevaluatedItems", "unevaluatedProperties":
 				cleaned[key] = cleanToolSchemaNode(value, true)
 			case "dependencies":

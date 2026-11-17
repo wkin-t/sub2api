@@ -4,8 +4,47 @@ import (
 	"encoding/json"
 	"testing"
 
+	"github.com/Wei-Shaw/sub2api/internal/pkg/apicompat"
 	"github.com/stretchr/testify/require"
 )
+
+func TestGeminiChatCompletionsSeparatesToolResultsFromFollowingUserText(t *testing.T) {
+	var request apicompat.ChatCompletionsRequest
+	require.NoError(t, json.Unmarshal([]byte(`{
+		"model":"gemini-4-argon",
+		"messages":[
+			{"role":"user","content":"What is the weather in Paris?"},
+			{"role":"assistant","tool_calls":[{"id":"call_weather","type":"function","function":{"name":"get_weather","arguments":"{\"city\":\"Paris\"}"}}]},
+			{"role":"tool","tool_call_id":"call_weather","content":"sunny, 20 C"},
+			{"role":"user","content":"Summarize that weather in one short sentence."}
+		]
+	}`), &request))
+	responses, err := chatCompletionsToResponses(nil, &request)
+	require.NoError(t, err)
+	anthropic, err := apicompat.ResponsesToAnthropicRequest(responses)
+	require.NoError(t, err)
+	body, err := json.Marshal(anthropic)
+	require.NoError(t, err)
+	geminiBody, err := convertClaudeMessagesToGeminiGenerateContent(body, request.Model)
+	require.NoError(t, err)
+	var got map[string]any
+	require.NoError(t, json.Unmarshal(geminiBody, &got))
+	contents, ok := got["contents"].([]any)
+	require.True(t, ok)
+	require.Len(t, contents, 4)
+	modelTurn, ok := contents[1].(map[string]any)
+	require.True(t, ok)
+	require.Equal(t, "model", modelTurn["role"])
+	resultTurn, ok := contents[2].(map[string]any)
+	require.True(t, ok)
+	require.Equal(t, "user", resultTurn["role"])
+	require.Equal(t, []any{map[string]any{"functionResponse": map[string]any{
+		"name": "get_weather", "response": map[string]any{"content": "sunny, 20 C"},
+	}}}, resultTurn["parts"])
+	require.Equal(t, map[string]any{"role": "user", "parts": []any{
+		map[string]any{"text": "Summarize that weather in one short sentence."},
+	}}, contents[3])
+}
 
 func TestGeminiResponseToChatCompletionsPreservesInlineData(t *testing.T) {
 	tests := []struct {

@@ -361,6 +361,134 @@ func TestConvertClaudeToolsToGeminiTools_CustomType(t *testing.T) {
 	}
 }
 
+func TestConvertClaudeMessagesToGeminiContents_PreservesParallelResultsAndMedia(t *testing.T) {
+	for _, multimodal := range []bool{false, true} {
+		t.Run(fmt.Sprintf("multimodal=%t", multimodal), func(t *testing.T) {
+			var messages []any
+			require.NoError(t, json.Unmarshal([]byte(`[
+				{"role":"assistant","content":[
+					{"type":"tool_use","id":"a","name":"first","input":{},"signature":"preserved-signature"},
+					{"type":"tool_use","id":"b","name":"second","input":{}}
+				]},
+				{"role":"user","content":[
+					{"type":"tool_result","tool_use_id":"a","content":[
+						{"type":"text","text":"first result"},
+						{"type":"image","source":{"type":"base64","media_type":"image/png","data":"aGVsbG8="}}
+					]},
+					{"type":"tool_result","tool_use_id":"b","content":"second result"},
+					{"type":"text","text":"Explain both results."}
+				]}
+			]`), &messages))
+			got, err := convertClaudeMessagesToGeminiContents(messages, make(map[string]string), multimodal)
+			require.NoError(t, err)
+			require.Len(t, got, 3)
+			model, ok := got[0].(map[string]any)
+			require.True(t, ok)
+			require.Equal(t, "model", model["role"])
+			calls, ok := model["parts"].([]any)
+			require.True(t, ok)
+			require.Len(t, calls, 2)
+			firstCall, ok := calls[0].(map[string]any)
+			require.True(t, ok)
+			require.Equal(t, "preserved-signature", firstCall["thoughtSignature"])
+			results, ok := got[1].(map[string]any)
+			require.True(t, ok)
+			require.Equal(t, "user", results["role"])
+			resultParts, ok := results["parts"].([]any)
+			require.True(t, ok)
+			require.Len(t, resultParts, 2)
+			firstPart, ok := resultParts[0].(map[string]any)
+			require.True(t, ok)
+			first, ok := firstPart["functionResponse"].(map[string]any)
+			require.True(t, ok)
+			secondPart, ok := resultParts[1].(map[string]any)
+			require.True(t, ok)
+			second, ok := secondPart["functionResponse"].(map[string]any)
+			require.True(t, ok)
+			require.Equal(t, "first", first["name"])
+			require.Equal(t, map[string]any{"content": "first result"}, first["response"])
+			require.Equal(t, "second", second["name"])
+			require.Equal(t, map[string]any{"content": "second result"}, second["response"])
+			followup, ok := got[2].(map[string]any)
+			require.True(t, ok)
+			require.Equal(t, "user", followup["role"])
+			followupParts, ok := followup["parts"].([]any)
+			require.True(t, ok)
+			require.Equal(t, map[string]any{"text": "Explain both results."}, followupParts[0])
+			image := map[string]any{"inlineData": map[string]any{"mimeType": "image/png", "data": "aGVsbG8="}}
+			if multimodal {
+				require.Equal(t, []any{image}, first["parts"])
+				require.Len(t, followupParts, 1)
+			} else {
+				require.NotContains(t, first, "parts")
+				require.Equal(t, []any{map[string]any{"text": "Explain both results."}, image}, followupParts)
+			}
+		})
+	}
+}
+
+func TestConvertClaudeMessagesToGeminiContents_DoesNotInventUserTurns(t *testing.T) {
+	messages := []any{
+		map[string]any{"role": "user", "content": "Question"},
+		map[string]any{"role": "assistant", "content": "Partial answer"},
+	}
+	got, err := convertClaudeMessagesToGeminiContents(messages, make(map[string]string), true)
+	require.NoError(t, err)
+	require.Equal(t, []any{
+		map[string]any{"role": "user", "parts": []any{map[string]any{"text": "Question"}}},
+		map[string]any{"role": "model", "parts": []any{map[string]any{"text": "Partial answer"}}},
+	}, got)
+}
+
+func TestCleanToolSchema_DropsPropertyNamesWithoutDroppingNamedProperties(t *testing.T) {
+	schema := map[string]any{
+		"type":          "object",
+		"propertyNames": map[string]any{"pattern": "^[a-z]+$"},
+		"properties": map[string]any{
+			"propertyNames": map[string]any{"type": "string"},
+			"options": map[string]any{
+				"type":          "object",
+				"propertyNames": map[string]any{"type": "string"},
+				"properties":    map[string]any{"enabled": map[string]any{"type": "boolean"}},
+			},
+			"entries": map[string]any{
+				"type": "array",
+				"items": map[string]any{
+					"anyOf": []any{map[string]any{
+						"type":          "object",
+						"propertyNames": map[string]any{"enum": []any{"allowed"}},
+					}},
+				},
+			},
+		},
+		"required": []any{"propertyNames"},
+		"default":  map[string]any{"propertyNames": "literal value"},
+	}
+
+	cleaned, ok := cleanToolSchema(schema).(map[string]any)
+	require.True(t, ok)
+	require.NotContains(t, cleaned, "propertyNames")
+	properties, ok := cleaned["properties"].(map[string]any)
+	require.True(t, ok)
+	require.Equal(t, map[string]any{"type": "STRING"}, properties["propertyNames"])
+	require.Equal(t, []any{"propertyNames"}, cleaned["required"])
+	require.Equal(t, map[string]any{"propertyNames": "literal value"}, cleaned["default"])
+	options, ok := properties["options"].(map[string]any)
+	require.True(t, ok)
+	require.NotContains(t, options, "propertyNames")
+	require.Contains(t, options["properties"], "enabled")
+	entries, ok := properties["entries"].(map[string]any)
+	require.True(t, ok)
+	items, ok := entries["items"].(map[string]any)
+	require.True(t, ok)
+	anyOf, ok := items["anyOf"].([]any)
+	require.True(t, ok)
+	branch, ok := anyOf[0].(map[string]any)
+	require.True(t, ok)
+	require.NotContains(t, branch, "propertyNames")
+	require.Contains(t, schema, "propertyNames")
+}
+
 func TestCleanToolSchema_NormalizesGeminiUnsupportedSchemaFields(t *testing.T) {
 	schema := map[string]any{
 		"type": "object",
@@ -986,11 +1114,12 @@ func TestConvertClaudeMessagesToGeminiGenerateContent_ExtractsToolResultImages(t
 	require.NoError(t, json.Unmarshal(converted, &geminiReq))
 	contents, ok := geminiReq["contents"].([]any)
 	require.True(t, ok)
+	require.Len(t, contents, 3)
 	content, ok := contents[1].(map[string]any)
 	require.True(t, ok)
 	parts, ok := content["parts"].([]any)
 	require.True(t, ok)
-	require.Len(t, parts, 4)
+	require.Len(t, parts, 2)
 
 	firstPart, ok := parts[0].(map[string]any)
 	require.True(t, ok)
@@ -1009,13 +1138,19 @@ func TestConvertClaudeMessagesToGeminiGenerateContent_ExtractsToolResultImages(t
 	require.True(t, ok)
 	require.Equal(t, "[image attached below]", secondResponseBody["content"])
 
-	firstImagePart, ok := parts[2].(map[string]any)
+	imageContent, ok := contents[2].(map[string]any)
+	require.True(t, ok)
+	require.Equal(t, "user", imageContent["role"])
+	imageParts, ok := imageContent["parts"].([]any)
+	require.True(t, ok)
+	require.Len(t, imageParts, 2)
+	firstImagePart, ok := imageParts[0].(map[string]any)
 	require.True(t, ok)
 	firstImage, ok := firstImagePart["inlineData"].(map[string]any)
 	require.True(t, ok)
 	require.Equal(t, "image/png", firstImage["mimeType"])
 	require.Equal(t, "aGVsbG8=", firstImage["data"])
-	secondImagePart, ok := parts[3].(map[string]any)
+	secondImagePart, ok := imageParts[1].(map[string]any)
 	require.True(t, ok)
 	secondImage, ok := secondImagePart["inlineData"].(map[string]any)
 	require.True(t, ok)
