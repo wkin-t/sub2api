@@ -182,6 +182,14 @@ export default {
         }
       },
       upstreamBilling: {
+        autoSyncGroup: '自动同步上游分组名称与备注',
+        autoSyncGroupHint: '成功探测后，上游提供的名称和描述会覆盖本地名称与备注。账号倍率由单独的开关控制。',
+        syncGroup: '同步上游分组名称与备注',
+        saveGroup: '同步并保存上游分组名称与备注',
+        groupCredentials: '请填写上游地址和 API Key。更换地址或代理后需重新输入密钥。',
+        groupUnavailable: '上游没有返回可同步的分组名称或描述。',
+        groupFailed: '同步上游分组信息失败',
+        groupSynced: '账号名称与备注已同步',
         trustWarning: '此倍率由上游站点针对当前 API Key 自行声明。Sub2API 无法验证该值是否与实际扣费一致；上游站点或中间代理可能返回伪造、过期或被篡改的数据。请结合账单、余额变化和实际用量自行核验。',
         autoProbe: '自动探测上游声明倍率',
         autoProbeHint: '启用后按全局周期刷新上游声明倍率；此开关本身不会修改账号倍率。',
@@ -297,6 +305,8 @@ export default {
       testConnection: '测试连接',
       reAuthorize: '重新授权',
       refreshToken: '刷新令牌',
+      refreshTokenHint: '系统已在后台自动刷新令牌，频繁手动刷新可能与自动刷新相互冲突，导致令牌失效、账号被暂停',
+      refreshTokenFrequentWarning: '距离上次手动刷新不足一分钟：频繁刷新可能与后台自动刷新冲突，导致令牌失效。如无必要请稍候再试。',
       noAccountsYet: '暂无账号',
       createFirstAccount: '添加 AI 平台账号以开始使用 API 网关。',
       tokenRefreshed: 'Token 刷新成功',

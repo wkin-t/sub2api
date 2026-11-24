@@ -37,3 +37,7 @@ CR 使用仓库 CI 对应的 golangci-lint 2.14.0，按 v0.2.20 过滤新增问�
 完整单测还在 Windows 上复现了上游原有 `TestOllamaProbeCallback_StaleLongDoesNotOverrideNewShort` 的时间构造问题：相邻 `time.Now()` 可能产生相同的冷却到期值，未真正构造出新 CAS 版本。未加本 fork 补丁的 v0.2.22 也失败。测试改为从既有到期值显式增加一秒，保留全部拒绝过期回调的断言；未改 Ollama 生产逻辑。
 
 同类时钟精度问题也会使 `TestCommandCodeGatewayPassesThroughCatalogProtocols` 的多个场景复用缓存键。测试 URL 增加场景序号，保留原协议和负载断言；未改协议目录生产逻辑。两条测试分别重复10次通过；最终完整单测61个包、13,092个顶层测试（含子测试28,222项）通过，前端关键及变更集合38文件782项通过。
+
+## v0.2.24 合并说明
+
+上游 `44db3dd72` 已原生合入末尾工具响应轮次的拆分逻辑，因此本次同步移除 `splitToolResultTurns` 参数分叉与循环内拆分实现，P2-ARCH-001 对应的自定义生产差异已消除；当前生产代码相对 `upstream/main` 仅保留 `cleanToolSchemaNode` 移除 `propertyNames` 关键字（P2-ARCH-002）。

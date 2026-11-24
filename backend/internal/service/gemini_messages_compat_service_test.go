@@ -379,7 +379,7 @@ func TestConvertClaudeMessagesToGeminiContents_PreservesParallelResultsAndMedia(
 					{"type":"text","text":"Explain both results."}
 				]}
 			]`), &messages))
-			got, err := convertClaudeMessagesToGeminiContents(messages, make(map[string]string), multimodal, true)
+			got, err := convertClaudeMessagesToGeminiContents(messages, make(map[string]string), multimodal)
 			require.NoError(t, err)
 			require.Len(t, got, 3)
 			model, ok := got[0].(map[string]any)
@@ -432,7 +432,7 @@ func TestConvertClaudeMessagesToGeminiContents_DoesNotInventUserTurns(t *testing
 		map[string]any{"role": "user", "content": "Question"},
 		map[string]any{"role": "assistant", "content": "Partial answer"},
 	}
-	got, err := convertClaudeMessagesToGeminiContents(messages, make(map[string]string), true, true)
+	got, err := convertClaudeMessagesToGeminiContents(messages, make(map[string]string), true)
 	require.NoError(t, err)
 	require.Equal(t, []any{
 		map[string]any{"role": "user", "parts": []any{map[string]any{"text": "Question"}}},
@@ -1039,7 +1039,7 @@ func TestConvertClaudeMessagesToGeminiGenerateContent_AddsThoughtSignatureForToo
 	}
 	b, _ := json.Marshal(claudeReq)
 
-	out, err := convertClaudeMessagesToGeminiGenerateContent(b, "gemini-2.5-flash", true)
+	out, err := convertClaudeMessagesToGeminiGenerateContent(b, "gemini-2.5-flash")
 	if err != nil {
 		t.Fatalf("convert failed: %v", err)
 	}
@@ -1107,7 +1107,7 @@ func TestConvertClaudeMessagesToGeminiGenerateContent_ExtractsToolResultImages(t
 	body, err := json.Marshal(claudeReq)
 	require.NoError(t, err)
 
-	converted, err := convertClaudeMessagesToGeminiGenerateContent(body, "gemini-2.5-flash", true)
+	converted, err := convertClaudeMessagesToGeminiGenerateContent(body, "gemini-2.5-flash")
 	require.NoError(t, err)
 
 	var geminiReq map[string]any
@@ -1119,6 +1119,9 @@ func TestConvertClaudeMessagesToGeminiGenerateContent_ExtractsToolResultImages(t
 	require.True(t, ok)
 	parts, ok := content["parts"].([]any)
 	require.True(t, ok)
+	// Gemini 拒绝 functionResponse 之后仍带其它 part 的轮次
+	//（"Requests ending with a model turn are not supported."），
+	// 工具结果图片因此被拆到紧随其后的独立 user 轮。
 	require.Len(t, parts, 2)
 
 	firstPart, ok := parts[0].(map[string]any)
@@ -1144,6 +1147,7 @@ func TestConvertClaudeMessagesToGeminiGenerateContent_ExtractsToolResultImages(t
 	imageParts, ok := imageContent["parts"].([]any)
 	require.True(t, ok)
 	require.Len(t, imageParts, 2)
+
 	firstImagePart, ok := imageParts[0].(map[string]any)
 	require.True(t, ok)
 	firstImage, ok := firstImagePart["inlineData"].(map[string]any)

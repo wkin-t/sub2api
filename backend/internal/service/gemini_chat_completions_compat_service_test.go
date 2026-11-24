@@ -25,7 +25,7 @@ func TestGeminiChatCompletionsSeparatesToolResultsFromFollowingUserText(t *testi
 	require.NoError(t, err)
 	body, err := json.Marshal(anthropic)
 	require.NoError(t, err)
-	geminiBody, err := convertClaudeMessagesToGeminiGenerateContent(body, request.Model, true)
+	geminiBody, err := convertClaudeMessagesToGeminiGenerateContent(body, request.Model)
 	require.NoError(t, err)
 	var got map[string]any
 	require.NoError(t, json.Unmarshal(geminiBody, &got))
