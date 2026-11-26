@@ -5,7 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strconv"
 
+	"github.com/Wei-Shaw/sub2api/internal/config"
 	infraerrors "github.com/Wei-Shaw/sub2api/internal/pkg/errors"
 	"github.com/Wei-Shaw/sub2api/internal/service"
 	"github.com/gin-gonic/gin"
@@ -38,7 +40,7 @@ func (h *GatewayHandler) pinnedOpenAIModels(c *gin.Context, group *service.Group
 		return
 	}
 	setOpsSelectedAccount(c, account.ID, account.Platform)
-	writeOpenAIModelsResponse(c, response)
+	writeOpenAIModelsResponseWithConfig(c, response, h.cfg)
 }
 
 func writeOpenAIModelsError(c *gin.Context, status int, errorType, message string) {
@@ -46,6 +48,10 @@ func writeOpenAIModelsError(c *gin.Context, status int, errorType, message strin
 }
 
 func writeOpenAIModelsResponse(c *gin.Context, manifest *service.OpenAIModelsResponse) {
+	writeOpenAIModelsResponseWithConfig(c, manifest, nil)
+}
+
+func writeOpenAIModelsResponseWithConfig(c *gin.Context, manifest *service.OpenAIModelsResponse, cfg *config.Config) {
 	if c.Param("model") != "" {
 		writeRetrievedModel(c, manifest.Body)
 		return
@@ -53,10 +59,30 @@ func writeOpenAIModelsResponse(c *gin.Context, manifest *service.OpenAIModelsRes
 	if manifest.ETag != "" {
 		c.Header("ETag", manifest.ETag)
 	}
+	zstdEnabled := cfg != nil && cfg.Gateway.OpenAIModelsResponseZstd
+	if zstdEnabled && c.Request != nil && c.Request.Method == http.MethodGet {
+		appendVaryHeader(c.Writer.Header(), "Accept-Encoding")
+		if c.Writer.Header().Get("Cache-Control") == "" {
+			c.Header("Cache-Control", "private, no-cache")
+		}
+	}
 	if manifest.NotModified {
 		c.Status(http.StatusNotModified)
 		c.Writer.WriteHeaderNow()
 		return
+	}
+	if zstdEnabled &&
+		c.Request != nil && c.Request.Method == http.MethodGet &&
+		len(manifest.Body) >= openAIModelsZstdMinBytes &&
+		c.Writer.Header().Get("Content-Encoding") == "" {
+		if acceptsZstdEncoding(c.GetHeader("Accept-Encoding")) {
+			if compressed, ok := defaultOpenAIModelsZstdCache.getOrCompress(manifest.Body); ok {
+				c.Header("Content-Encoding", "zstd")
+				c.Header("Content-Length", strconv.Itoa(len(compressed)))
+				c.Data(http.StatusOK, "application/json", compressed)
+				return
+			}
+		}
 	}
 	c.Data(http.StatusOK, "application/json", manifest.Body)
 }

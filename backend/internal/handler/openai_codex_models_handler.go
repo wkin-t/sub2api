@@ -67,7 +67,7 @@ func (h *OpenAIGatewayHandler) CodexModels(c *gin.Context) {
 			if c.Request.Context().Err() != nil {
 				return
 			}
-			writeOpenAIModelsResponse(c, pinnedManifest)
+			writeOpenAIModelsResponseWithConfig(c, pinnedManifest, h.cfg)
 			return
 		}
 	}
@@ -86,7 +86,7 @@ func (h *OpenAIGatewayHandler) CodexModels(c *gin.Context) {
 			return
 		}
 		if configured {
-			writeOpenAIModelsResponse(c, configuredManifest)
+			writeOpenAIModelsResponseWithConfig(c, configuredManifest, h.cfg)
 			return
 		}
 	}
@@ -147,7 +147,7 @@ func (h *OpenAIGatewayHandler) CodexModels(c *gin.Context) {
 			return
 		}
 
-		writeOpenAIModelsResponse(c, manifest)
+		writeOpenAIModelsResponseWithConfig(c, manifest, h.cfg)
 		return
 	}
 }

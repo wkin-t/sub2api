@@ -32,16 +32,14 @@ import (
 var chatgptCodexModelsURL = "https://chatgpt.com/backend-api/codex/models"
 
 const (
-	openAIModelsCacheBodyLimit = 1 << 20
-	// openAIModelsCacheMaxEntries 上限按「账号数 × 客户端版本数 × 代理形态」
-	// 估算：缓存同时覆盖 OAuth 与 API Key 账号，且缓存键含 Authorization 与
-	// Version 头，不同客户端版本各自占一条；64 条在大规模部署下会被淘汰导致
-	// 额外上游请求。单条清单通常几十 KB，512 条最坏内存占用在几十 MB 量级。
-	openAIModelsCacheMaxEntries = 512
+	// 单条缓存上限放宽至 4 MiB（配合 64 MiB 总字节预算兜底），避免 >512 KiB 的 Codex 清单被静默跳过；
+	// 条目上限保留 512 兼容小清单多账号部署，大清单场景由 openAIModelsCacheMaxTotalBytes 严格封顶总内存。
+	openAIModelsCacheBodyLimit     = 4 << 20
+	openAIModelsCacheMaxTotalBytes = 64 << 20
+	openAIModelsCacheMaxEntries    = 512
 	// 三段时效：≤TTL 为新鲜（直接返回缓存，零上游请求）；TTL 到 StaleTTL 之间
 	// 乐观返回旧值并后台单飞刷新（携带上游 ETag，304 续期）；超过 StaleTTL 丢弃
-	// 缓存同步等待刷新。TTL 取 1 分钟：manifest 变化低频，1 分钟内同账号重复
-	// 请求完全吸收；StaleTTL 取 5 分钟，控制旧内容最长可见时间在分钟级。
+	// 缓存同步等待刷新。保持 TTL 60s / StaleTTL 5m 以保留 SWR 异步刷新窗口。
 	openAIModelsCacheTTL              = 60 * time.Second
 	openAIModelsCacheStaleTTL         = 5 * time.Minute
 	codexModelsManifestRequestTimeout = 15 * time.Second
@@ -1649,6 +1647,7 @@ type openAIModelsRequest struct {
 
 type openAIModelsCacheEntry struct {
 	manifest   *OpenAIModelsResponse
+	sizeBytes  int
 	order      uint64
 	expiresAt  time.Time
 	staleUntil time.Time
@@ -1663,10 +1662,18 @@ const (
 )
 
 type openAIModelsCache struct {
-	mu        sync.Mutex
-	entries   map[string]openAIModelsCacheEntry
-	nextOrder uint64
-	refresh   singleflight.Group
+	mu         sync.Mutex
+	entries    map[string]openAIModelsCacheEntry
+	totalBytes int
+	nextOrder  uint64
+	refresh    singleflight.Group
+}
+
+func openAIModelsManifestByteSize(manifest *OpenAIModelsResponse) int {
+	if manifest == nil {
+		return 0
+	}
+	return len(manifest.Body) + len(manifest.upstreamSourceBody)
 }
 
 func (c *openAIModelsCache) get(key string, now time.Time) (*OpenAIModelsResponse, openAIModelsCacheState) {
@@ -1677,6 +1684,7 @@ func (c *openAIModelsCache) get(key string, now time.Time) (*OpenAIModelsRespons
 		return nil, openAIModelsCacheMiss
 	}
 	if !now.Before(entry.staleUntil) {
+		c.totalBytes -= entry.sizeBytes
 		delete(c.entries, key)
 		return nil, openAIModelsCacheMiss
 	}
@@ -1687,11 +1695,8 @@ func (c *openAIModelsCache) get(key string, now time.Time) (*OpenAIModelsRespons
 }
 
 func (c *openAIModelsCache) set(key string, manifest *OpenAIModelsResponse, now time.Time) {
-	if manifest == nil || len(manifest.Body) > openAIModelsCacheBodyLimit {
-		return
-	}
-	remainingBodyBudget := openAIModelsCacheBodyLimit - len(manifest.Body)
-	if len(manifest.upstreamSourceBody) > remainingBodyBudget {
+	entryBytes := openAIModelsManifestByteSize(manifest)
+	if manifest == nil || entryBytes > openAIModelsCacheBodyLimit || entryBytes > openAIModelsCacheMaxTotalBytes {
 		return
 	}
 	c.mu.Lock()
@@ -1699,30 +1704,40 @@ func (c *openAIModelsCache) set(key string, manifest *OpenAIModelsResponse, now 
 	if c.entries == nil {
 		c.entries = make(map[string]openAIModelsCacheEntry)
 	}
-	if _, exists := c.entries[key]; !exists && len(c.entries) >= openAIModelsCacheMaxEntries {
+	if existing, exists := c.entries[key]; exists {
+		c.totalBytes -= existing.sizeBytes
+		delete(c.entries, key)
+	}
+	for candidateKey, entry := range c.entries {
+		if !now.Before(entry.staleUntil) {
+			c.totalBytes -= entry.sizeBytes
+			delete(c.entries, candidateKey)
+		}
+	}
+	for len(c.entries) > 0 && (len(c.entries) >= openAIModelsCacheMaxEntries || c.totalBytes+entryBytes > openAIModelsCacheMaxTotalBytes) {
 		oldestKey := ""
 		var oldestOrder uint64
 		for candidateKey, entry := range c.entries {
-			if !now.Before(entry.staleUntil) {
-				delete(c.entries, candidateKey)
-				continue
-			}
 			if oldestKey == "" || entry.order < oldestOrder {
 				oldestKey = candidateKey
 				oldestOrder = entry.order
 			}
 		}
-		if len(c.entries) >= openAIModelsCacheMaxEntries && oldestKey != "" {
-			delete(c.entries, oldestKey)
+		if oldestKey == "" {
+			break
 		}
+		c.totalBytes -= c.entries[oldestKey].sizeBytes
+		delete(c.entries, oldestKey)
 	}
 	c.nextOrder++
 	c.entries[key] = openAIModelsCacheEntry{
 		manifest:   manifest,
+		sizeBytes:  entryBytes,
 		order:      c.nextOrder,
 		expiresAt:  now.Add(openAIModelsCacheTTL),
 		staleUntil: now.Add(openAIModelsCacheStaleTTL),
 	}
+	c.totalBytes += entryBytes
 }
 
 // FetchCodexModelsManifest fetches the live Codex models manifest from either
@@ -2037,6 +2052,10 @@ func (s *OpenAIGatewayService) fetchOpenAIModelsUpstream(ctx context.Context, re
 			retryable: true,
 		}
 	}
+	// 收紧 io.ReadAll 扩容产生的多余容量，避免缓存常驻内存超出 len 记账。
+	if cap(body) > len(body)+(len(body)>>2) {
+		body = bytes.Clone(body)
+	}
 	etag := resp.Header.Get("ETag")
 	return &OpenAIModelsResponse{Body: body, ETag: etag, upstreamETag: etag}, nil
 }
@@ -2097,11 +2116,17 @@ func (s *OpenAIGatewayService) fetchCodexModelsManifestUpstream(ctx context.Cont
 		}
 	}
 	etag := response.upstreamETag
+	// 仅 API Key 路径会在 CompleteAPIKeyCodexModelsManifestForClient 中读取 upstreamSourceBody；
+	// OAuth 路径不保留冗余副本，避免缓存预算翻倍和热路径额外拷贝。
+	var upstreamSourceBody []byte
+	if request.useAPIKeyUpstream {
+		upstreamSourceBody = append([]byte(nil), upstreamBody...)
+	}
 	manifest := &OpenAIModelsResponse{
 		Body:                         body,
 		ETag:                         etag,
 		upstreamETag:                 etag,
-		upstreamSourceBody:           append([]byte(nil), upstreamBody...),
+		upstreamSourceBody:           upstreamSourceBody,
 		convertedFromOpenAIModelList: convertedFromOpenAIModelList,
 	}
 	if request.useAPIKeyUpstream && !bytes.Equal(body, upstreamBody) {

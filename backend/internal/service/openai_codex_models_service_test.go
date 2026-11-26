@@ -2908,9 +2908,9 @@ func TestFetchCodexModelsManifestAPIKeyCacheBoundsEntriesAndBodySize(t *testing.
 		body := `{"models":[]}`
 		switch {
 		case strings.Contains(req.URL.Host, "large-source"):
-			body = `{"object":"list","data":[{"id":"model-a","padding":"` + strings.Repeat("x", 1<<20) + `"}]}`
+			body = `{"object":"list","data":[{"id":"model-a","padding":"` + strings.Repeat("x", openAIModelsCacheBodyLimit) + `"}]}`
 		case strings.Contains(req.URL.Host, "large"):
-			body = `{"models":[],"padding":"` + strings.Repeat("x", (1<<20)+1) + `"}`
+			body = `{"models":[],"padding":"` + strings.Repeat("x", openAIModelsCacheBodyLimit+1) + `"}`
 		}
 		return &http.Response{
 			StatusCode: http.StatusOK,

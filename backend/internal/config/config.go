@@ -1082,6 +1082,9 @@ type GatewayConfig struct {
 	UpstreamResponseReadMaxBytes int64 `mapstructure:"upstream_response_read_max_bytes"`
 	// 上游模型列表响应体读取上限（字节）
 	ModelsListReadMaxBytes int64 `mapstructure:"models_list_read_max_bytes"`
+	// OpenAIModelsResponseZstd 控制 OpenAI /v1/models（含 Codex 模型清单）是否对声明
+	// Accept-Encoding 含 zstd 的客户端返回预压 zstd 响应（默认关闭，可通过环境变量一键回滚）。
+	OpenAIModelsResponseZstd bool `mapstructure:"openai_models_response_zstd"`
 	// 代理探测响应体读取上限（字节）
 	ProxyProbeResponseReadMaxBytes int64 `mapstructure:"proxy_probe_response_read_max_bytes"`
 	// Gemini 上游响应头调试日志开关（默认关闭，避免高频日志开销）
@@ -2632,6 +2635,7 @@ func setDefaults() {
 	viper.SetDefault("gateway.text_max_body_size", int64(32*1024*1024))
 	viper.SetDefault("gateway.upstream_response_read_max_bytes", DefaultUpstreamResponseReadMaxBytes)
 	viper.SetDefault("gateway.models_list_read_max_bytes", DefaultModelsListReadMaxBytes)
+	viper.SetDefault("gateway.openai_models_response_zstd", false)
 	viper.SetDefault("gateway.proxy_probe_response_read_max_bytes", int64(1024*1024))
 	viper.SetDefault("gateway.gemini_debug_response_headers", false)
 	viper.SetDefault("gateway.gemini_cached_content_max_ttl_seconds", 86400)
